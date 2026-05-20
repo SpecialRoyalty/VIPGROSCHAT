@@ -19,7 +19,8 @@ import {
   freeMessage,
   premiumMessage,
   alreadyFreeMessage,
-  alreadyPremiumMessage
+  alreadyPremiumMessage,
+  welcomeMessage
 } from "./messages.js";
 import {
   teaserKeyboard,
@@ -53,6 +54,37 @@ async function safeReply(ctx, text, extra = {}) {
   }
 }
 
+async function handleFreeSignup(ctx) {
+  const result = await markFree(ctx);
+
+  if (result.already) {
+    return ctx.reply(alreadyFreeMessage, freeUpsellKeyboard());
+  }
+
+  if (result.realPosition > 50) {
+    return ctx.reply(
+      `🎁 Tu es actuellement ${result.position}e sur la liste d’attente du VIP Gratuit.
+
+Les 50 premières places gratuites sont déjà très demandées.
+
+🔥 Tu peux rejoindre la liste prioritaire VIP Premium pour être prévenu en premier.`,
+      freeUpsellKeyboard()
+    );
+  }
+
+  return ctx.reply(freeMessage(result.position), freeUpsellKeyboard());
+}
+
+async function handlePremiumSignup(ctx) {
+  const result = await markPremium(ctx);
+
+  if (result.already) {
+    return ctx.reply(alreadyPremiumMessage);
+  }
+
+  return ctx.reply(premiumMessage);
+}
+
 async function publishTeaser() {
   if (!GROUP_ID) throw new Error("GROUP_ID manquant");
   if (!TEASER_PHOTO_URL) throw new Error("TEASER_PHOTO_URL manquant");
@@ -62,7 +94,6 @@ async function publishTeaser() {
     TEASER_PHOTO_URL,
     {
       caption: teaserCaption,
-      parse_mode: undefined,
       ...teaserKeyboard()
     }
   );
@@ -195,7 +226,17 @@ Envoyés : ${ok}
 }
 
 bot.start(async ctx => {
-  await safeReply(ctx, "Bienvenue 👋\nLe VIP arrive bientôt. Surveille le groupe pour le teaser.");
+  const payload = ctx.startPayload;
+
+  if (payload === "free") {
+    return handleFreeSignup(ctx);
+  }
+
+  if (payload === "premium") {
+    return handlePremiumSignup(ctx);
+  }
+
+  await safeReply(ctx, welcomeMessage);
 });
 
 bot.command("admin", async ctx => {
@@ -211,35 +252,12 @@ bot.on("message", async ctx => {
 
 bot.action("interest_free", async ctx => {
   await ctx.answerCbQuery().catch(() => {});
-  const result = await markFree(ctx);
-
-  if (result.already) {
-    return ctx.reply(alreadyFreeMessage, freeUpsellKeyboard());
-  }
-
-  if (result.realPosition > 50) {
-    return ctx.reply(
-      `🎁 Tu es actuellement ${result.position}e sur la liste d’attente du VIP Gratuit.
-
-Les 50 premières places gratuites sont déjà très demandées.
-
-🔥 Tu peux rejoindre la liste prioritaire VIP Premium pour être prévenu en premier.`,
-      freeUpsellKeyboard()
-    );
-  }
-
-  return ctx.reply(freeMessage(result.position), freeUpsellKeyboard());
+  return handleFreeSignup(ctx);
 });
 
 bot.action("interest_premium", async ctx => {
   await ctx.answerCbQuery().catch(() => {});
-  const result = await markPremium(ctx);
-
-  if (result.already) {
-    return ctx.reply(alreadyPremiumMessage);
-  }
-
-  return ctx.reply(premiumMessage);
+  return handlePremiumSignup(ctx);
 });
 
 bot.action("admin_stats", async ctx => {
@@ -252,7 +270,8 @@ bot.action("admin_publish_once", async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery("Accès refusé");
   await ctx.answerCbQuery("Publication...");
   try {
-    await checkBotAdmin();
+    const admin = await checkBotAdmin();
+    if (!admin.ok) throw new Error(admin.text);
     await publishTeaser();
     await addLog(ctx, "ADMIN_PUBLISH_ONCE");
     await ctx.reply("✅ Teaser publié dans le groupe.");
@@ -304,7 +323,9 @@ bot.action("admin_logs", async ctx => {
     return `• ${user} — ${l.action} — ${new Date(l.created_at).toLocaleString("fr-FR")}`;
   }).join("\n");
 
-  await ctx.reply(`📜 Logs récents\n\n${text}`);
+  await ctx.reply(`📜 Logs récents
+
+${text}`);
 });
 
 bot.action("admin_health", async ctx => {
@@ -346,7 +367,7 @@ cron.schedule("*/20 * * * *", async () => {
 const app = express();
 
 app.get("/", (_, res) => {
-  res.send("VIP teaser bot is running.");
+  res.send("GrosChat VIP teaser bot is running.");
 });
 
 app.get("/health", async (_, res) => {

@@ -39,3 +39,9 @@ Tu peux aussi rejoindre la liste prioritaire VIP Premium si tu veux être préve
 export const alreadyPremiumMessage = `✅ Tu es déjà inscrit sur la liste prioritaire VIP Premium.
 
 Tu seras prévenu dès l’ouverture officielle.`;
+
+export const welcomeMessage = `Bienvenue 👋
+
+Le VIP arrive bientôt.
+
+Utilise les boutons dans le groupe pour rejoindre une liste d’attente.`;

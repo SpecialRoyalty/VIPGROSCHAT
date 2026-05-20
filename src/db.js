@@ -70,6 +70,8 @@ export async function setSetting(key, value) {
 
 export async function upsertUser(ctx) {
   const from = ctx.from;
+  if (!from?.id) return;
+
   await pool.query(
     `
     INSERT INTO users(telegram_id, username, first_name, last_name)

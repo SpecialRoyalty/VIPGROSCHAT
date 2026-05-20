@@ -1,9 +1,11 @@
 import { Markup } from "telegraf";
 
+const BOT_USERNAME = process.env.BOT_USERNAME || "GrosChatVIP_bot";
+
 export function teaserKeyboard() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback("🎁 VIP Gratuit", "interest_free")],
-    [Markup.button.callback("🔥 VIP Premium (+80 000 médias)", "interest_premium")]
+    [Markup.button.url("🎁 VIP Gratuit", `https://t.me/${BOT_USERNAME}?start=free`)],
+    [Markup.button.url("🔥 VIP Premium (+80 000 médias)", `https://t.me/${BOT_USERNAME}?start=premium`)]
   ]);
 }
 
