@@ -61,3 +61,13 @@ Le bot doit être admin du groupe principal avec permission :
 - Ajoute `BOT_USERNAME`, par exemple `GrosChatVIP_bot`.
 - Ajoute un délai de confirmation `CONFIRM_AFTER_MINUTES`.
 - Si l’utilisateur choisit TikTok/Reddit/etc puis ne clique ni OUI ni NON, il est retiré après ce délai.
+
+
+## Correctif fixed4 — message d'instruction
+
+- Le message d'instruction n'est plus épinglé.
+- Le bot n'envoie plus ce message en boucle.
+- Quand quelqu'un entre dans le groupe principal :
+  1. il supprime le précédent message d'instruction
+  2. il envoie un nouveau message propre
+- Les jobs automatiques ne recréent plus ce message.

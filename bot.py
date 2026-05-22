@@ -1,7 +1,7 @@
 
 import os
 import random
-from datetime import datetime, timedelta, time, UTC
+from datetime import datetime, timedelta, time
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, Column, Integer, BigInteger, String, Text, Boolean, DateTime, text as sql_text
@@ -172,7 +172,7 @@ def db():
 
 
 def now_utc():
-    return datetime.now(UTC).replace(tzinfo=None)
+    return datetime.utcnow()
 
 
 def today_key():
@@ -358,11 +358,22 @@ def looks_suspicious_user(user):
     return bool(reasons), ", ".join(reasons)
 
 
-async def ensure_pinned_instruction(context, central_chat_id):
+async def send_join_instruction_once(context, central_chat_id):
+    """
+    Envoie un seul message d'instruction quand quelqu'un entre.
+    Supprime le précédent message d'instruction avant d'envoyer le nouveau.
+    Ne s'exécute PAS en boucle, seulement à l'arrivée d'un membre.
+    """
     with db() as s:
+        old_message_id = get_config(s, "central_last_instruction_message_id", "")
         active_count = s.query(User).filter_by(accepted=True, banned_forever=False).count()
         pending_count = s.query(User).filter(User.pending_kick_until != None, User.banned_forever == False).count()
-        message_id = get_config(s, "central_pinned_instruction_message_id", "")
+
+    if old_message_id:
+        try:
+            await context.bot.delete_message(central_chat_id, int(old_message_id))
+        except Exception:
+            pass
 
     text = (
         "📌 Instructions du groupe\n\n"
@@ -373,22 +384,23 @@ async def ensure_pinned_instruction(context, central_chat_id):
         f"Actifs : {active_count} | En attente : {pending_count}"
     )
 
-    if message_id:
-        try:
-            await context.bot.edit_message_text(chat_id=central_chat_id, message_id=int(message_id), text=text, reply_markup=central_instruction_buttons())
-            return
-        except Exception:
-            pass
-
-    msg = await context.bot.send_message(central_chat_id, text, reply_markup=central_instruction_buttons())
-    try:
-        await context.bot.pin_chat_message(central_chat_id, msg.message_id, disable_notification=True)
-    except Exception:
-        pass
+    msg = await context.bot.send_message(
+        central_chat_id,
+        text,
+        reply_markup=central_instruction_buttons()
+    )
 
     with db() as s:
-        set_config(s, "central_pinned_instruction_message_id", str(msg.message_id))
+        set_config(s, "central_last_instruction_message_id", str(msg.message_id))
         s.commit()
+
+
+async def ensure_pinned_instruction(context, central_chat_id):
+    """
+    Compatibilité avec les anciens appels admin.
+    Ne crée plus de message automatique répétitif.
+    """
+    await send_join_instruction_once(context, central_chat_id)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -526,7 +538,7 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
         s.add(JoinRequestLog(user_id=user.id, username=user.username, first_name=user.first_name, status="approved", reason=reason))
         s.commit()
 
-    await ensure_pinned_instruction(context, chat.id)
+    await send_join_instruction_once(context, chat.id)
 
 
 async def new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -557,7 +569,7 @@ async def new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u.joined_central_at = now_utc()
             u.pending_kick_until = now_utc() + timedelta(minutes=KICK_AFTER_MINUTES)
             s.commit()
-        await ensure_pinned_instruction(context, chat.id)
+        await send_join_instruction_once(context, chat.id)
 
 
 async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -675,7 +687,7 @@ async def handle_admin(q, context, data):
                     g.is_promo = False
                     g.is_active = True
             s.commit()
-        await ensure_pinned_instruction(context, chat_id)
+        await send_join_instruction_once(context, chat_id)
         await safe_callback_text(q, "✅ Groupe principal enregistré.", reply_markup=groups_menu())
         return
     if data == "groups:pin_instruction":
@@ -684,7 +696,7 @@ async def handle_admin(q, context, data):
         if not central:
             await safe_callback_text(q, "Aucun groupe principal défini.", reply_markup=groups_menu())
             return
-        await ensure_pinned_instruction(context, central.chat_id)
+        await send_join_instruction_once(context, central.chat_id)
         await safe_callback_text(q, "📌 Message épinglé créé/mis à jour.", reply_markup=groups_menu())
         return
     if data == "groups:promo_list":
@@ -1049,8 +1061,7 @@ async def scheduled_kicks(context):
         await kick_from_central(context, uid, permanent=False)
     for uid in perm:
         await kick_from_central(context, uid, permanent=True)
-    if central:
-        await ensure_pinned_instruction(context, central.chat_id)
+    # Pas de message automatique ici : le message d'instruction est envoyé seulement quand quelqu'un entre.
 
 
 async def proof_and_bio_cutoff_check(context, force=False):
@@ -1161,8 +1172,7 @@ async def open_new_session(context):
     with db() as s:
         central = s.query(Group).filter_by(is_central=True).first()
         users = s.query(User).filter_by(accepted=True, banned_forever=False).all()
-    if central:
-        await ensure_pinned_instruction(context, central.chat_id)
+    # Pas de message automatique ici : le message d'instruction est envoyé seulement quand quelqu'un entre.
     for u in users:
         try:
             await context.bot.send_message(u.telegram_id, "Nouvelle session ouverte. Envoie ta preuve du jour avant 21h50.")
@@ -1179,8 +1189,7 @@ async def catchup_jobs(context):
         await delete_reward_message(context)
     with db() as s:
         central = s.query(Group).filter_by(is_central=True).first()
-    if central:
-        await ensure_pinned_instruction(context, central.chat_id)
+    # Pas de message automatique ici : le message d'instruction est envoyé seulement quand quelqu'un entre.
 
 
 async def boot_session_message(context):
