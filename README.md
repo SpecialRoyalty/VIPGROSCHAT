@@ -102,3 +102,48 @@ REWARD_START_HOUR=22
 LOCK_END_HOUR=1
 ADMIN_REWARD_REMINDER_HOUR=18
 ```
+
+
+## V3 — demandes d’adhésion et bio
+
+- Les liens créés par le bot utilisent maintenant `creates_join_request=True`.
+- Entre 22h et 01h, les demandes d’adhésion sont refusées automatiquement, sans kick/ban définitif.
+- À partir de 01h, les demandes peuvent être acceptées à nouveau.
+- Le bot vérifie `PUBLIC_BIO_TAG` dans la bio publique quand Telegram rend la bio accessible au bot.
+- Si la bio est inaccessible ou ne contient pas le tag, la demande est refusée proprement avec un message privé.
+- Une nouvelle table est créée :
+  - `antijavana_bot_join_requests`
+
+Variables optionnelles supplémentaires :
+
+```env
+REQUIRE_BIO_TAG=true
+PUBLIC_BIO_TAG=@antijavana
+```
+
+Important : pour que les demandes d’adhésion fonctionnent, le groupe principal doit autoriser les demandes d’adhésion via les liens d’invitation créés par le bot. Le bot crée déjà ces liens en mode demande.
+
+## V4 — améliorations opérationnelles
+
+- Kick des utilisateurs sans preuve avancé à 21h50.
+- Vérification quotidienne de la bio avant récompense : si le tag requis est retiré, kick temporaire.
+- Message d’instruction épinglé permanent, édité au lieu d’être supprimé/recréé.
+- Jobs rattrapables après redémarrage Railway : contrôle preuves/bio, publication récompense, suppression récompense.
+- Rappels admin multiples si aucun lien récompense n’est prêt.
+- Récompense publiée vers 22h05 puis supprimée automatiquement à 00h45.
+- Réduction des bans immédiats : non-clic/refus = kick temporaire la première fois, ban à la deuxième récidive.
+- Anti multi-comptes limité par ce que Telegram expose : option pour mettre les comptes sans username en revue/refus.
+
+Variables optionnelles :
+
+```env
+PROOF_KICK_HOUR=21
+PROOF_KICK_MINUTE=50
+REWARD_DELETE_HOUR=0
+REWARD_DELETE_MINUTE=45
+ADMIN_REWARD_REMINDER_HOURS=12,18,21
+MIN_USERNAME_REQUIRED=true
+SUSPICIOUS_REQUIRES_ADMIN=true
+```
+
+Note : Telegram Bot API ne donne pas l’âge réel d’un compte, donc on ne peut pas vérifier l’âge du compte automatiquement.

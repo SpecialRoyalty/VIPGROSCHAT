@@ -12,7 +12,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatType
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler,
-    ChatMemberHandler, ContextTypes, filters
+    ChatMemberHandler, ChatJoinRequestHandler, ContextTypes, filters
 )
 
 load_dotenv()
@@ -27,6 +27,14 @@ PROOF_DEADLINE_HOUR = int(os.getenv("PROOF_DEADLINE_HOUR", "22"))
 REWARD_START_HOUR = int(os.getenv("REWARD_START_HOUR", "22"))
 LOCK_END_HOUR = int(os.getenv("LOCK_END_HOUR", "1"))
 ADMIN_REWARD_REMINDER_HOUR = int(os.getenv("ADMIN_REWARD_REMINDER_HOUR", "18"))
+ADMIN_REWARD_REMINDER_HOURS = [int(x) for x in os.getenv("ADMIN_REWARD_REMINDER_HOURS", "12,18,21").split(",") if x.strip().isdigit()]
+PROOF_KICK_HOUR = int(os.getenv("PROOF_KICK_HOUR", "21"))
+PROOF_KICK_MINUTE = int(os.getenv("PROOF_KICK_MINUTE", "50"))
+REWARD_DELETE_HOUR = int(os.getenv("REWARD_DELETE_HOUR", "0"))
+REWARD_DELETE_MINUTE = int(os.getenv("REWARD_DELETE_MINUTE", "45"))
+MIN_USERNAME_REQUIRED = os.getenv("MIN_USERNAME_REQUIRED", "true").lower() == "true"
+SUSPICIOUS_REQUIRES_ADMIN = os.getenv("SUSPICIOUS_REQUIRES_ADMIN", "true").lower() == "true"
+REQUIRE_BIO_TAG = os.getenv("REQUIRE_BIO_TAG", "true").lower() == "true"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN manquant")
@@ -87,6 +95,9 @@ class User(Base):
     banned_forever = Column(Boolean, default=False)
     banned_reason = Column(Text, nullable=True)
     last_private_notice_at = Column(DateTime, nullable=True)
+    no_click_count = Column(Integer, default=0)
+    suspicious = Column(Boolean, default=False)
+    manual_review = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -106,6 +117,9 @@ class Reward(Base):
     url = Column(Text, nullable=False)
     active = Column(Boolean, default=True)
     published = Column(Boolean, default=False)
+    message_id = Column(BigInteger, nullable=True)
+    published_at = Column(DateTime, nullable=True)
+    deleted_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -120,6 +134,18 @@ class Proof(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+
+class JoinRequestLog(Base):
+    __tablename__ = "antijavana_bot_join_requests"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(BigInteger, index=True, nullable=False)
+    username = Column(String(255), nullable=True)
+    first_name = Column(String(255), nullable=True)
+    status = Column(String(50), default="pending")  # approved/refused/blocked
+    reason = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 Base.metadata.create_all(engine)
 
 
@@ -130,6 +156,12 @@ def migrate():
         "ALTER TABLE antijavana_bot_users ADD COLUMN IF NOT EXISTS banned_forever BOOLEAN DEFAULT FALSE",
         "ALTER TABLE antijavana_bot_users ADD COLUMN IF NOT EXISTS banned_reason TEXT",
         "ALTER TABLE antijavana_bot_users ADD COLUMN IF NOT EXISTS last_private_notice_at TIMESTAMP",
+        "ALTER TABLE antijavana_bot_users ADD COLUMN IF NOT EXISTS no_click_count INTEGER DEFAULT 0",
+        "ALTER TABLE antijavana_bot_users ADD COLUMN IF NOT EXISTS suspicious BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE antijavana_bot_users ADD COLUMN IF NOT EXISTS manual_review BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE antijavana_bot_rewards ADD COLUMN IF NOT EXISTS message_id BIGINT",
+        "ALTER TABLE antijavana_bot_rewards ADD COLUMN IF NOT EXISTS published_at TIMESTAMP",
+        "ALTER TABLE antijavana_bot_rewards ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP",
         "ALTER TABLE antijavana_bot_proofs ADD COLUMN IF NOT EXISTS session_date VARCHAR(20)",
     ]
     with engine.begin() as conn:
@@ -161,6 +193,19 @@ def is_reward_lock_time(dt=None) -> bool:
     dt = dt or now_utc()
     h = dt.hour
     return h >= REWARD_START_HOUR or h < LOCK_END_HOUR
+
+
+def proof_cutoff_passed(dt=None) -> bool:
+    dt = dt or now_utc()
+    return (dt.hour, dt.minute) >= (PROOF_KICK_HOUR, PROOF_KICK_MINUTE)
+
+
+def already_done(session, job_name: str) -> bool:
+    return get_config(session, f"job_done:{job_name}:{today_key()}", "") == "1"
+
+
+def mark_done(session, job_name: str):
+    set_config(session, f"job_done:{job_name}:{today_key()}", "1")
 
 
 def get_config(session, key: str, default: str = "") -> str:
@@ -304,32 +349,42 @@ async def my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         s.commit()
 
 
-async def delete_previous_central_instruction(context, central_chat_id: int):
+async def send_unique_central_instruction(context, central_chat_id: int, member_name: str = ""):
+    # V4: message épinglé permanent, édité au lieu d’être supprimé/recréé.
     with db() as s:
-        old_id = get_config(s, "central_instruction_message_id", "")
-    if old_id:
+        active_count = s.query(User).filter_by(accepted=True, banned_forever=False).count()
+        pending_count = s.query(User).filter(User.pending_kick_until != None, User.banned_forever == False).count()
+        message_id = get_config(s, "central_pinned_instruction_message_id", "")
+
+    text = (
+        "📌 Instructions du groupe\n\n"
+        "Pour rester ici, clique sur le bouton ci-dessous et termine le processus en privé.\n\n"
+        f"⏱ Délai après entrée : {KICK_AFTER_MINUTES} min\n"
+        f"📸 Preuve obligatoire avant {PROOF_KICK_HOUR:02d}h{PROOF_KICK_MINUTE:02d}\n"
+        f"🔒 Fermeture récompense : {REWARD_START_HOUR:02d}h → {LOCK_END_HOUR:02d}h\n\n"
+        f"Actifs : {active_count} | En attente : {pending_count}"
+    )
+
+    if message_id:
         try:
-            await context.bot.delete_message(central_chat_id, int(old_id))
+            await context.bot.edit_message_text(
+                chat_id=central_chat_id,
+                message_id=int(message_id),
+                text=text,
+                reply_markup=central_instruction_buttons()
+            )
+            return
         except Exception:
             pass
 
-
-async def send_unique_central_instruction(context, central_chat_id: int, member_name: str = ""):
-    await delete_previous_central_instruction(context, central_chat_id)
-    text = (
-        f"Bonjour {member_name}.\n\n"
-        f"Pour rester ici et participer à la session du jour, continue en privé avec le bot.\n\n"
-        f"Tu as {KICK_AFTER_MINUTES} minutes pour cliquer."
-    )
-    msg = await context.bot.send_message(
-        central_chat_id,
-        text,
-        reply_markup=central_instruction_buttons()
-    )
+    msg = await context.bot.send_message(central_chat_id, text, reply_markup=central_instruction_buttons())
+    try:
+        await context.bot.pin_chat_message(central_chat_id, msg.message_id, disable_notification=True)
+    except Exception:
+        pass
     with db() as s:
-        set_config(s, "central_instruction_message_id", str(msg.message_id))
+        set_config(s, "central_pinned_instruction_message_id", str(msg.message_id))
         s.commit()
-
 
 async def new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -355,16 +410,15 @@ async def new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await kick_from_central(context, member.id, permanent=True)
                 continue
 
-            # Nobody joins during reward window 22h-01h.
+            # Fallback si quelqu'un entre sans join request pendant 22h-01h :
+            # on le retire, mais on ne le bannit pas définitivement.
             if is_reward_lock_time():
-                u.banned_forever = True
-                u.banned_reason = "Tentative de rejoindre pendant la fenêtre récompense 22h-01h"
                 s.commit()
                 try:
-                    await context.bot.send_message(member.id, "Le groupe est fermé entre 22h et 01h. Tu ne peux pas rejoindre pendant la distribution.")
+                    await context.bot.send_message(member.id, "Le groupe est fermé entre 22h et 01h. Refais une demande après 01h.")
                 except Exception:
                     pass
-                await kick_from_central(context, member.id, permanent=True)
+                await kick_from_central(context, member.id, permanent=False)
                 continue
 
             u.joined_central_at = now_utc()
@@ -431,10 +485,11 @@ async def handle_admin(q, context, data):
             users = s.query(User).count()
             accepted = s.query(User).filter_by(accepted=True, banned_forever=False).count()
             banned = s.query(User).filter_by(banned_forever=True).count()
+            join_refused = s.query(JoinRequestLog).filter_by(status="refused").count()
             groups = s.query(Group).count()
             promos = s.query(Group).filter_by(is_promo=True, is_active=True).count()
             counts = {b: s.query(User).filter_by(branch=b, accepted=True, banned_forever=False).count() for b in BRANCHES}
-        txt = f"📊 Statistiques\n\nUtilisateurs : {users}\nActifs : {accepted}\nBannis définitifs : {banned}\nGroupes détectés : {groups}\nGroupes pub actifs : {promos}\n\n"
+        txt = f"📊 Statistiques\n\nUtilisateurs : {users}\nActifs : {accepted}\nBannis définitifs : {banned}\nDemandes refusées : {join_refused}\nGroupes détectés : {groups}\nGroupes pub actifs : {promos}\n\n"
         txt += "\n".join(f"{BRANCH_LABELS[b]} : {c}" for b, c in counts.items())
         await q.edit_message_text(txt, reply_markup=back_main())
         return
@@ -604,9 +659,9 @@ async def handle_user_callback(q, context, data):
             invite = await context.bot.create_chat_invite_link(
                 chat_id=central.chat_id,
                 member_limit=1,
-                creates_join_request=False
+                creates_join_request=True
             )
-            await q.edit_message_text("Clique ici pour rejoindre :", reply_markup=InlineKeyboardMarkup([
+            await q.edit_message_text("Clique ici pour envoyer une demande d’adhésion :", reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🚪 Rejoindre le groupe", url=invite.invite_link)]
             ]))
         except Exception as e:
@@ -864,72 +919,132 @@ async def scheduled_kicks(context):
         await kick_from_central(context, uid, permanent=True)
 
 
-async def proof_deadline_check(context):
-    # At 22:00, kick users without proof. They may return once only.
+async def proof_deadline_check(context: ContextTypes.DEFAULT_TYPE):
+    # V4: contrôle à 21h50 + revérification bio avant récompense. Job rattrapable.
     session = today_key()
     with db() as s:
+        if already_done(s, "proof_bio_cutoff"):
+            return
+        if not proof_cutoff_passed():
+            return
         active = s.query(User).filter_by(accepted=True, banned_forever=False).all()
-        central = s.query(Group).filter_by(is_central=True).first()
-
-        to_kick_temp = []
-        to_ban_perm = []
-
-        for u in active:
-            has_proof = s.query(Proof).filter_by(user_id=u.telegram_id, session_date=session).first()
-            if has_proof:
-                continue
-
-            u.accepted = False
-            u.branch = None
-            u.pending_kick_until = None
-            u.proof_miss_count = (u.proof_miss_count or 0) + 1
-
-            if u.proof_miss_count >= 2:
-                u.banned_forever = True
-                u.banned_reason = "Deuxième absence de preuve avant 22h"
-                to_ban_perm.append(u.telegram_id)
-            else:
-                to_kick_temp.append(u.telegram_id)
-
+        mark_done(s, "proof_bio_cutoff")
         s.commit()
 
-    for uid in to_kick_temp:
-        try:
-            await context.bot.send_message(
-                uid,
-                "Tu n’as pas envoyé ta preuve avant 22h. Tu as été retiré du groupe. Tu peux revenir une seule fois et refaire le processus."
-            )
-        except Exception:
-            pass
-        await kick_from_central(context, uid, permanent=False)
+    to_kick_temp, to_ban_perm, bio_removed = [], [], []
 
+    for u in active:
+        bio_ok, _ = await validate_bio_tag(context, u.telegram_id)
+        if not bio_ok:
+            bio_removed.append(u.telegram_id)
+            with db() as s:
+                uu = s.query(User).filter_by(telegram_id=u.telegram_id).first()
+                if uu:
+                    uu.accepted = False
+                    uu.branch = None
+                    uu.pending_kick_until = None
+                s.commit()
+            continue
+
+        with db() as s:
+            has_proof = s.query(Proof).filter_by(user_id=u.telegram_id, session_date=session).first()
+            uu = s.query(User).filter_by(telegram_id=u.telegram_id).first()
+            if has_proof or not uu:
+                continue
+            uu.accepted = False
+            uu.branch = None
+            uu.pending_kick_until = None
+            uu.proof_miss_count = (uu.proof_miss_count or 0) + 1
+            if uu.proof_miss_count >= 2:
+                uu.banned_forever = True
+                uu.banned_reason = "Deuxième absence de preuve avant cutoff"
+                to_ban_perm.append(uu.telegram_id)
+            else:
+                to_kick_temp.append(uu.telegram_id)
+            s.commit()
+
+    for uid in bio_removed:
+        await kick_from_central(context, uid, permanent=False)
+    for uid in to_kick_temp:
+        await kick_from_central(context, uid, permanent=False)
     for uid in to_ban_perm:
-        try:
-            await context.bot.send_message(
-                uid,
-                "Tu n’as pas envoyé ta preuve une deuxième fois. Accès définitivement bloqué."
-            )
-        except Exception:
-            pass
         await kick_from_central(context, uid, permanent=True)
 
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(admin_id, f"✅ Contrôle 21h50 terminé. Bio retirée: {len(bio_removed)} | Sans preuve: {len(to_kick_temp)} | Bans: {len(to_ban_perm)}")
+        except Exception:
+            pass
 
-async def publish_reward(context):
-    # Reward is published once daily in 22h-01h window, then next session starts after 01h.
+async def publish_reward(context: ContextTypes.DEFAULT_TYPE):
+    # V4: publication rattrapable, stocke le message pour suppression 00h45.
     with db() as s:
+        if already_done(s, "reward_publish"):
+            return
+        if now_utc().hour < REWARD_START_HOUR or (now_utc().hour == REWARD_START_HOUR and now_utc().minute < 5):
+            return
         central = s.query(Group).filter_by(is_central=True).first()
         reward = s.query(Reward).filter_by(active=True, published=False).order_by(Reward.created_at.asc()).first()
-        if not central or not reward:
+        if not central:
+            return
+        if not reward:
+            s.commit()
+            for admin_id in ADMIN_IDS:
+                try:
+                    await context.bot.send_message(admin_id, "⚠️ Aucun lien récompense en attente. Ajoute un lien dans le panel.")
+                except Exception:
+                    pass
             return
         url = reward.url
-        reward.published = True
+        reward_id = reward.id
+        mark_done(s, "reward_publish")
         s.commit()
 
     try:
-        await context.bot.send_message(central.chat_id, f"🎁 Récompense du jour :\n{url}")
+        msg = await context.bot.send_message(central.chat_id, f"🎁 Récompense du jour :\n{url}")
+        with db() as s:
+            r = s.query(Reward).filter_by(id=reward_id).first()
+            if r:
+                r.published = True
+                r.published_at = now_utc()
+                r.message_id = msg.message_id
+            s.commit()
     except Exception:
         pass
 
+
+async def delete_reward_message(context: ContextTypes.DEFAULT_TYPE):
+    # V4: suppression automatique du message récompense à 00h45, rattrapable.
+    n = now_utc()
+    if not ((n.hour == REWARD_DELETE_HOUR and n.minute >= REWARD_DELETE_MINUTE) or (n.hour > REWARD_DELETE_HOUR and n.hour < LOCK_END_HOUR)):
+        return
+    with db() as s:
+        if already_done(s, "reward_delete"):
+            return
+        central = s.query(Group).filter_by(is_central=True).first()
+        rewards = s.query(Reward).filter(Reward.published == True, Reward.deleted_at == None, Reward.message_id != None).all()
+        mark_done(s, "reward_delete")
+        s.commit()
+    if not central:
+        return
+    deleted = 0
+    for r in rewards:
+        try:
+            await context.bot.delete_message(central.chat_id, int(r.message_id))
+            deleted += 1
+            with db() as s:
+                rr = s.query(Reward).filter_by(id=r.id).first()
+                if rr:
+                    rr.deleted_at = now_utc()
+                s.commit()
+        except Exception:
+            pass
+    if deleted:
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(admin_id, "🧹 Récompense supprimée automatiquement à 00h45.")
+            except Exception:
+                pass
 
 async def admin_reward_reminder(context):
     with db() as s:
@@ -955,14 +1070,21 @@ async def open_new_session(context):
             pass
 
 
+async def catchup_jobs(context):
+    await proof_deadline_check(context)
+    await publish_reward(context)
+    await delete_reward_message(context)
+    with db() as s:
+        central = s.query(Group).filter_by(is_central=True).first()
+    if central:
+        await send_unique_central_instruction(context, central.chat_id)
+
+
 async def boot_session_message(context):
-    # t=0 after deploy: notify admins that the proof session is active.
+    await catchup_jobs(context)
     for admin_id in ADMIN_IDS:
         try:
-            await context.bot.send_message(
-                admin_id,
-                "✅ Bot démarré. Session de preuves active. Les utilisateurs devront envoyer leur capture avant 22h."
-            )
+            await context.bot.send_message(admin_id, "✅ Bot V4 démarré. Jobs rattrapables actifs : preuves/bio, récompense, suppression 00h45.")
         except Exception:
             pass
 
@@ -972,6 +1094,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(ChatJoinRequestHandler(handle_join_request))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_members))
     app.add_handler(CallbackQueryHandler(admin_callbacks))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, register_group), group=1)
@@ -986,7 +1109,7 @@ def main():
     app.job_queue.run_daily(publish_reward, time=time(hour=REWARD_START_HOUR, minute=5))
     app.job_queue.run_daily(open_new_session, time=time(hour=LOCK_END_HOUR, minute=0))
 
-    print("Bot V2 PostgreSQL démarré avec tables isolées antijavana_bot_*. Lock 22h-01h, preuves quotidiennes, bans.")
+    print("Bot V4 PostgreSQL démarré : anti-abuse, pinned message, catchup jobs, reward cleanup.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
