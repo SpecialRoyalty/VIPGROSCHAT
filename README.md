@@ -5,6 +5,7 @@
 ```env
 BOT_TOKEN=ton_token_botfather
 ADMIN_IDS=ton_id_telegram
+BOT_USERNAME=GrosChatVIP_bot
 DATABASE_URL=${{Postgres.DATABASE_URL}}
 ```
 
@@ -14,6 +15,7 @@ DATABASE_URL=${{Postgres.DATABASE_URL}}
 PUBLIC_BIO_TAG=@antijavana
 REQUIRE_BIO_TAG=true
 KICK_AFTER_MINUTES=30
+CONFIRM_AFTER_MINUTES=30
 PROOF_KICK_HOUR=21
 PROOF_KICK_MINUTE=50
 REWARD_START_HOUR=22
@@ -50,3 +52,12 @@ Le bot doit être admin du groupe principal avec permission :
 - inviter via lien
 - épingler les messages
 - supprimer les messages
+
+
+## Correctifs fixed3
+
+- Corrige `There is no text in the message to edit` quand le bouton est sur une photo.
+- Depuis un groupe, le bouton “Demander l’accès” renvoie d’abord vers le bot en privé.
+- Ajoute `BOT_USERNAME`, par exemple `GrosChatVIP_bot`.
+- Ajoute un délai de confirmation `CONFIRM_AFTER_MINUTES`.
+- Si l’utilisateur choisit TikTok/Reddit/etc puis ne clique ni OUI ni NON, il est retiré après ce délai.

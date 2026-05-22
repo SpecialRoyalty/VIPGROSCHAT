@@ -18,11 +18,13 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
 
 PUBLIC_BIO_TAG = os.getenv("PUBLIC_BIO_TAG", "@antijavana").strip()
 REQUIRE_BIO_TAG = os.getenv("REQUIRE_BIO_TAG", "true").lower() == "true"
 
 KICK_AFTER_MINUTES = int(os.getenv("KICK_AFTER_MINUTES", "30"))
+CONFIRM_AFTER_MINUTES = int(os.getenv("CONFIRM_AFTER_MINUTES", "30"))
 PROOF_KICK_HOUR = int(os.getenv("PROOF_KICK_HOUR", "21"))
 PROOF_KICK_MINUTE = int(os.getenv("PROOF_KICK_MINUTE", "50"))
 REWARD_START_HOUR = int(os.getenv("REWARD_START_HOUR", "22"))
@@ -84,6 +86,8 @@ class User(Base):
     accepted = Column(Boolean, default=False)
     last_proof_at = Column(DateTime, nullable=True)
     pending_kick_until = Column(DateTime, nullable=True)
+    pending_confirm_until = Column(DateTime, nullable=True)
+    pending_confirm_branch = Column(String(50), nullable=True)
     proof_miss_count = Column(Integer, default=0)
     no_click_count = Column(Integer, default=0)
     suspicious = Column(Boolean, default=False)
@@ -142,6 +146,8 @@ Base.metadata.create_all(engine)
 
 def migrate():
     statements = [
+        "ALTER TABLE antijavana_bot_users ADD COLUMN IF NOT EXISTS pending_confirm_until TIMESTAMP",
+        "ALTER TABLE antijavana_bot_users ADD COLUMN IF NOT EXISTS pending_confirm_branch VARCHAR(50)",
         "ALTER TABLE antijavana_bot_users ADD COLUMN IF NOT EXISTS proof_miss_count INTEGER DEFAULT 0",
         "ALTER TABLE antijavana_bot_users ADD COLUMN IF NOT EXISTS no_click_count INTEGER DEFAULT 0",
         "ALTER TABLE antijavana_bot_users ADD COLUMN IF NOT EXISTS suspicious BOOLEAN DEFAULT FALSE",
@@ -305,6 +311,31 @@ async def notify_admins(context, text):
             pass
 
 
+async def safe_callback_text(q, text, reply_markup=None):
+    """Edits text messages, edits caption messages, or sends a new message if Telegram cannot edit."""
+    try:
+        if q.message and (q.message.text is not None):
+            return await safe_callback_text(q, text, reply_markup=reply_markup)
+        if q.message and (q.message.caption is not None):
+            return await q.edit_message_caption(caption=text, reply_markup=reply_markup)
+        return await q.message.reply_text(text, reply_markup=reply_markup)
+    except Exception:
+        try:
+            return await q.message.reply_text(text, reply_markup=reply_markup)
+        except Exception:
+            return None
+
+
+def bot_start_url(context=None):
+    username = BOT_USERNAME
+    try:
+        if not username and context and context.bot and context.bot.username:
+            username = context.bot.username
+    except Exception:
+        pass
+    return f"https://t.me/{username}" if username else None
+
+
 async def validate_bio_tag(context, user_id):
     if not REQUIRE_BIO_TAG:
         return True, "bio check disabled"
@@ -380,7 +411,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u.redirected_private = True
         s.commit()
 
-    await update.message.reply_text("🎉 Bienvenue en privé.\n\nChoisis une plateforme :", reply_markup=platform_choice_buttons())
+    await update.message.reply_text(
+        f"🎉 Bienvenue.\n\n1) Mets {PUBLIC_BIO_TAG} dans ta bio publique.\n2) Clique ci-dessous pour demander l’accès au groupe.",
+        reply_markup=user_join_button()
+    )
 
 
 async def register_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -532,7 +566,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data or ""
     if data.startswith(("admin:", "groups:", "ad:", "platform", "reward", "review:")):
         if not is_admin(q.from_user.id):
-            await q.edit_message_text("Accès refusé.")
+            await safe_callback_text(q, "Accès refusé.")
             return
         await handle_admin(q, context, data)
     else:
@@ -541,19 +575,19 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_admin(q, context, data):
     if data == "admin:main":
-        await q.edit_message_text("🛠 Panel admin", reply_markup=main_menu())
+        await safe_callback_text(q, "🛠 Panel admin", reply_markup=main_menu())
         return
     if data == "admin:groups":
-        await q.edit_message_text("📣 Gestion des groupes", reply_markup=groups_menu())
+        await safe_callback_text(q, "📣 Gestion des groupes", reply_markup=groups_menu())
         return
     if data == "admin:ad":
-        await q.edit_message_text("🧲 Gestion publicité", reply_markup=ad_menu())
+        await safe_callback_text(q, "🧲 Gestion publicité", reply_markup=ad_menu())
         return
     if data == "admin:platforms":
-        await q.edit_message_text("🌐 Configuration des plateformes", reply_markup=platform_menu())
+        await safe_callback_text(q, "🌐 Configuration des plateformes", reply_markup=platform_menu())
         return
     if data == "admin:rewards":
-        await q.edit_message_text("🎁 Récompenses", reply_markup=InlineKeyboardMarkup([
+        await safe_callback_text(q, "🎁 Récompenses", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Ajouter lien récompense", callback_data="reward:add")],
             [InlineKeyboardButton("📋 Voir liens en attente", callback_data="reward:list")],
             [InlineKeyboardButton("⬅️ Menu principal", callback_data="admin:main")]
@@ -563,7 +597,7 @@ async def handle_admin(q, context, data):
         with db() as s:
             users = s.query(User).filter_by(manual_review=True, banned_forever=False).limit(10).all()
         if not users:
-            await q.edit_message_text("Aucune revue manuelle en attente.", reply_markup=back_main())
+            await safe_callback_text(q, "Aucune revue manuelle en attente.", reply_markup=back_main())
             return
         txt = "🧑‍⚖️ Revues manuelles\n\n"
         buttons = []
@@ -571,16 +605,16 @@ async def handle_admin(q, context, data):
             txt += f"ID {u.telegram_id} — @{u.username or 'aucun'} — {u.first_name or ''}\n"
             buttons.append([InlineKeyboardButton(f"Décider {u.telegram_id}", callback_data=f"review:open:{u.telegram_id}")])
         buttons.append([InlineKeyboardButton("⬅️ Menu", callback_data="admin:main")])
-        await q.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(buttons))
+        await safe_callback_text(q, txt, reply_markup=InlineKeyboardMarkup(buttons))
         return
     if data.startswith("review:open:"):
         uid = int(data.split(":")[-1])
         with db() as s:
             u = s.query(User).filter_by(telegram_id=uid).first()
         if not u:
-            await q.edit_message_text("Utilisateur introuvable.", reply_markup=back_main())
+            await safe_callback_text(q, "Utilisateur introuvable.", reply_markup=back_main())
             return
-        await q.edit_message_text(f"Revue utilisateur\n\nID: {u.telegram_id}\nUsername: @{u.username or 'aucun'}\nNom: {u.first_name or ''}", reply_markup=manual_review_buttons(uid))
+        await safe_callback_text(q, f"Revue utilisateur\n\nID: {u.telegram_id}\nUsername: @{u.username or 'aucun'}\nNom: {u.first_name or ''}", reply_markup=manual_review_buttons(uid))
         return
     if data.startswith("review:approve:"):
         uid = int(data.split(":")[-1])
@@ -590,7 +624,7 @@ async def handle_admin(q, context, data):
                 u.manual_review = False
                 u.suspicious = False
             s.commit()
-        await q.edit_message_text("✅ Utilisateur approuvé côté panel. Il peut refaire une demande.", reply_markup=back_main())
+        await safe_callback_text(q, "✅ Utilisateur approuvé côté panel. Il peut refaire une demande.", reply_markup=back_main())
         return
     if data.startswith("review:refuse:"):
         uid = int(data.split(":")[-1])
@@ -600,13 +634,13 @@ async def handle_admin(q, context, data):
                 u.manual_review = False
                 u.no_click_count = (u.no_click_count or 0) + 1
             s.commit()
-        await q.edit_message_text("❌ Utilisateur refusé.", reply_markup=back_main())
+        await safe_callback_text(q, "❌ Utilisateur refusé.", reply_markup=back_main())
         return
     if data == "admin:proofs":
         with db() as s:
             pending = s.query(Proof).filter_by(session_date=today_key(), status="pending").count()
             accepted = s.query(User).filter_by(accepted=True, banned_forever=False).count()
-        await q.edit_message_text(f"✅ Preuves du jour\n\nUtilisateurs actifs : {accepted}\nPreuves reçues : {pending}", reply_markup=back_main())
+        await safe_callback_text(q, f"✅ Preuves du jour\n\nUtilisateurs actifs : {accepted}\nPreuves reçues : {pending}", reply_markup=back_main())
         return
     if data == "admin:stats":
         with db() as s:
@@ -620,17 +654,17 @@ async def handle_admin(q, context, data):
             counts = {b: s.query(User).filter_by(branch=b, accepted=True, banned_forever=False).count() for b in BRANCHES}
         txt = f"📊 Statistiques\n\nUtilisateurs : {users}\nActifs : {accepted}\nBannis : {banned}\nRevues : {manual}\nDemandes refusées : {refused}\nGroupes : {groups}\nGroupes pub actifs : {promos}\n\n"
         txt += "\n".join(f"{BRANCH_LABELS[b]} : {c}" for b, c in counts.items())
-        await q.edit_message_text(txt, reply_markup=back_main())
+        await safe_callback_text(q, txt, reply_markup=back_main())
         return
     if data == "groups:choose_central":
         with db() as s:
             groups = s.query(Group).order_by(Group.updated_at.desc()).limit(30).all()
         if not groups:
-            await q.edit_message_text("Aucun groupe détecté.", reply_markup=groups_menu())
+            await safe_callback_text(q, "Aucun groupe détecté.", reply_markup=groups_menu())
             return
         buttons = [[InlineKeyboardButton(("⭐ " if g.is_central else "") + (g.title or str(g.chat_id)), callback_data=f"groups:set_central:{g.chat_id}")] for g in groups]
         buttons.append([InlineKeyboardButton("⬅️ Retour", callback_data="admin:groups")])
-        await q.edit_message_text("Choisis le groupe principal :", reply_markup=InlineKeyboardMarkup(buttons))
+        await safe_callback_text(q, "Choisis le groupe principal :", reply_markup=InlineKeyboardMarkup(buttons))
         return
     if data.startswith("groups:set_central:"):
         chat_id = int(data.split(":")[-1])
@@ -642,16 +676,16 @@ async def handle_admin(q, context, data):
                     g.is_active = True
             s.commit()
         await ensure_pinned_instruction(context, chat_id)
-        await q.edit_message_text("✅ Groupe principal enregistré.", reply_markup=groups_menu())
+        await safe_callback_text(q, "✅ Groupe principal enregistré.", reply_markup=groups_menu())
         return
     if data == "groups:pin_instruction":
         with db() as s:
             central = s.query(Group).filter_by(is_central=True).first()
         if not central:
-            await q.edit_message_text("Aucun groupe principal défini.", reply_markup=groups_menu())
+            await safe_callback_text(q, "Aucun groupe principal défini.", reply_markup=groups_menu())
             return
         await ensure_pinned_instruction(context, central.chat_id)
-        await q.edit_message_text("📌 Message épinglé créé/mis à jour.", reply_markup=groups_menu())
+        await safe_callback_text(q, "📌 Message épinglé créé/mis à jour.", reply_markup=groups_menu())
         return
     if data == "groups:promo_list":
         with db() as s:
@@ -664,7 +698,7 @@ async def handle_admin(q, context, data):
                 mark = "✅" if g.is_promo and g.is_active else "⬜"
                 buttons.append([InlineKeyboardButton(f"{mark} {g.title or g.chat_id}", callback_data=f"groups:toggle_promo:{g.chat_id}")])
         buttons.append([InlineKeyboardButton("⬅️ Retour", callback_data="admin:groups")])
-        await q.edit_message_text("Coche/décoche les groupes publicité actifs :", reply_markup=InlineKeyboardMarkup(buttons))
+        await safe_callback_text(q, "Coche/décoche les groupes publicité actifs :", reply_markup=InlineKeyboardMarkup(buttons))
         return
     if data.startswith("groups:toggle_promo:"):
         chat_id = int(data.split(":")[-1])
@@ -682,15 +716,15 @@ async def handle_admin(q, context, data):
             promos = s.query(Group).filter_by(is_promo=True, is_active=True).all()
         txt = f"⭐ Principal : {central.title if central else 'non défini'}\n\n📢 Groupes pub actifs :\n"
         txt += "\n".join(f"- {g.title or g.chat_id}" for g in promos) if promos else "Aucun"
-        await q.edit_message_text(txt, reply_markup=groups_menu())
+        await safe_callback_text(q, txt, reply_markup=groups_menu())
         return
     if data == "ad:set_text":
         context.user_data["admin_waiting"] = "ad_text"
-        await q.edit_message_text("Envoie le texte de publicité.")
+        await safe_callback_text(q, "Envoie le texte de publicité.")
         return
     if data == "ad:set_photo":
         context.user_data["admin_waiting"] = "ad_photo"
-        await q.edit_message_text("Envoie la photo de publicité.")
+        await safe_callback_text(q, "Envoie la photo de publicité.")
         return
     if data == "ad:preview":
         await send_ad_preview(q.message.chat_id, context)
@@ -700,22 +734,22 @@ async def handle_admin(q, context, data):
         return
     if data.startswith("platform:") and data != "platform:balance":
         branch = data.split(":")[-1]
-        await q.edit_message_text(f"🌐 {BRANCH_LABELS[branch]}", reply_markup=platform_edit_menu(branch))
+        await safe_callback_text(q, f"🌐 {BRANCH_LABELS[branch]}", reply_markup=platform_edit_menu(branch))
         return
     if data == "platform:balance":
         with db() as s:
             counts = {b: s.query(User).filter_by(branch=b, accepted=True, banned_forever=False).count() for b in BRANCHES}
-        await q.edit_message_text("\n".join(f"{BRANCH_LABELS[b]} : {c}" for b, c in counts.items()), reply_markup=platform_menu())
+        await safe_callback_text(q, "\n".join(f"{BRANCH_LABELS[b]} : {c}" for b, c in counts.items()), reply_markup=platform_menu())
         return
     if data.startswith("platform_text:"):
         branch = data.split(":")[-1]
         context.user_data["admin_waiting"] = f"platform_text:{branch}"
-        await q.edit_message_text(f"Envoie le texte pour {BRANCH_LABELS[branch]}.")
+        await safe_callback_text(q, f"Envoie le texte pour {BRANCH_LABELS[branch]}.")
         return
     if data.startswith("platform_photo:"):
         branch = data.split(":")[-1]
         context.user_data["admin_waiting"] = f"platform_photo:{branch}"
-        await q.edit_message_text(f"Envoie la photo pour {BRANCH_LABELS[branch]}.")
+        await safe_callback_text(q, f"Envoie la photo pour {BRANCH_LABELS[branch]}.")
         return
     if data.startswith("platform_preview:"):
         await send_platform_preview(q.message.chat_id, context, data.split(":")[-1])
@@ -725,47 +759,67 @@ async def handle_admin(q, context, data):
         with db() as s:
             row = s.query(BranchContent).filter_by(branch=branch).first()
             if not row or not row.instructions or not row.photo_file_id:
-                await q.edit_message_text("Il manque le texte ou la photo.", reply_markup=platform_edit_menu(branch))
+                await safe_callback_text(q, "Il manque le texte ou la photo.", reply_markup=platform_edit_menu(branch))
                 return
             row.is_complete = True
             s.commit()
-        await q.edit_message_text("✅ Plateforme validée.", reply_markup=platform_menu())
+        await safe_callback_text(q, "✅ Plateforme validée.", reply_markup=platform_menu())
         return
     if data == "reward:add":
         context.user_data["admin_waiting"] = "reward_url"
-        await q.edit_message_text("Envoie le lien récompense.")
+        await safe_callback_text(q, "Envoie le lien récompense.")
         return
     if data == "reward:list":
         with db() as s:
             rewards = s.query(Reward).filter_by(published=False).order_by(Reward.created_at.asc()).limit(10).all()
         txt = "\n".join(f"{r.id}. {r.url}" for r in rewards) if rewards else "Aucun lien en attente."
-        await q.edit_message_text(txt, reply_markup=back_main())
+        await safe_callback_text(q, txt, reply_markup=back_main())
         return
 
 
 async def handle_user_callback(q, context, data):
     user = q.from_user
     if data == "user:join":
-        if is_reward_lock_time():
-            await q.edit_message_text("Le groupe est fermé entre 22h et 01h. Reviens après 01h.")
+        # Si le bouton est cliqué depuis un groupe, Telegram ne garantit pas que l'utilisateur
+        # ait déjà lancé le bot en privé. On le redirige donc d'abord vers le bot.
+        if q.message and q.message.chat and q.message.chat.type != ChatType.PRIVATE:
+            url = bot_start_url(context)
+            if url:
+                await q.answer("Ouvre le bot en privé pour continuer.", show_alert=True)
+                try:
+                    await q.message.reply_text(
+                        "Pour demander l’accès, ouvre d’abord le bot en privé :",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🤖 Ouvrir le bot", url=url)]])
+                    )
+                except Exception:
+                    pass
+            else:
+                await q.answer("Ouvre le bot en privé avec /start.", show_alert=True)
             return
+
+        if is_reward_lock_time():
+            await safe_callback_text(q, "Le groupe est fermé entre 22h et 01h. Reviens après 01h.")
+            return
+
         with db() as s:
             u = s.query(User).filter_by(telegram_id=user.id).first()
             if u and u.banned_forever:
-                await q.edit_message_text("Accès refusé.")
+                await safe_callback_text(q, "Accès refusé.")
                 return
             central = s.query(Group).filter_by(is_central=True).first()
         if not central:
-            await q.edit_message_text("Le groupe principal n’est pas configuré.")
+            await safe_callback_text(q, "Le groupe principal n’est pas configuré.")
             return
+
         try:
             invite = await context.bot.create_chat_invite_link(chat_id=central.chat_id, creates_join_request=True)
-            await q.edit_message_text(
+            await safe_callback_text(
+                q,
                 f"Mets {PUBLIC_BIO_TAG} dans ta bio publique puis demande l’accès :",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚪 Envoyer une demande", url=invite.invite_link)]])
             )
         except Exception as e:
-            await q.edit_message_text(f"Erreur invitation : {e}")
+            await safe_callback_text(q, f"Erreur invitation : {e}")
         return
     if data == "user:interested":
         try:
@@ -786,12 +840,24 @@ async def handle_user_callback(q, context, data):
             row = s.query(BranchContent).filter_by(branch=branch).first()
             instructions = row.instructions if row and row.instructions else f"Instructions pour {BRANCH_LABELS[branch]}."
             photo = row.photo_file_id if row else None
-        txt = f"Plateforme attribuée : {BRANCH_LABELS[branch]}\n\n{instructions}\n\nConfirmes-tu ?"
+        with db() as s:
+            u = s.query(User).filter_by(telegram_id=user.id).first()
+            if not u:
+                u = User(telegram_id=user.id, username=user.username, first_name=user.first_name)
+                s.add(u)
+            u.pending_confirm_branch = branch
+            u.pending_confirm_until = now_utc() + timedelta(minutes=CONFIRM_AFTER_MINUTES)
+            s.commit()
+
+        txt = f"Plateforme attribuée : {BRANCH_LABELS[branch]}\n\n{instructions}\n\nConfirmes-tu ?\n\nTu as {CONFIRM_AFTER_MINUTES} minutes pour répondre."
         if photo:
             await q.message.reply_photo(photo=photo, caption=txt, reply_markup=confirm_buttons(branch))
-            await q.delete_message()
+            try:
+                await q.delete_message()
+            except Exception:
+                pass
         else:
-            await q.edit_message_text(txt, reply_markup=confirm_buttons(branch))
+            await safe_callback_text(q, txt, reply_markup=confirm_buttons(branch))
         return
     if data.startswith("user_confirm:"):
         _, ans, branch = data.split(":")
@@ -804,16 +870,20 @@ async def handle_user_callback(q, context, data):
                 u.branch = branch
                 u.accepted = True
                 u.pending_kick_until = None
+                u.pending_confirm_until = None
+                u.pending_confirm_branch = None
                 s.commit()
-                await q.edit_message_text("✅ Validé. Envoie ta preuve chaque jour avant 21h50.")
+                await safe_callback_text(q, "✅ Validé. Envoie ta preuve chaque jour avant 21h50.")
             else:
                 u.accepted = False
+                u.pending_confirm_until = None
+                u.pending_confirm_branch = None
                 u.no_click_count = (u.no_click_count or 0) + 1
                 permanent = u.no_click_count >= 2
                 if permanent:
                     u.banned_forever = True
                 s.commit()
-                await q.edit_message_text("❌ Refus enregistré.")
+                await safe_callback_text(q, "❌ Refus enregistré.")
                 await kick_from_central(context, user.id, permanent=permanent)
         return
 
@@ -839,7 +909,7 @@ async def send_ad_preview(chat_id, context):
 
 async def publish_ad_to_promos(q, context):
     if is_reward_lock_time():
-        await q.edit_message_text("Publication bloquée entre 22h et 01h.", reply_markup=groups_menu())
+        await safe_callback_text(q, "Publication bloquée entre 22h et 01h.", reply_markup=groups_menu())
         return
     with db() as s:
         promos = s.query(Group).filter_by(is_promo=True, is_active=True).all()
@@ -855,7 +925,7 @@ async def publish_ad_to_promos(q, context):
             ok += 1
         except Exception:
             fail += 1
-    await q.edit_message_text(f"Envoyé : {ok}\nÉchecs : {fail}", reply_markup=groups_menu())
+    await safe_callback_text(q, f"Envoyé : {ok}\nÉchecs : {fail}", reply_markup=groups_menu())
 
 
 async def send_platform_preview(chat_id, context, branch):
@@ -954,10 +1024,20 @@ async def scheduled_kicks(context):
     now = now_utc()
     with db() as s:
         expired = s.query(User).filter(User.pending_kick_until != None, User.pending_kick_until <= now, User.accepted == False, User.banned_forever == False).all()
+        confirm_expired = s.query(User).filter(User.pending_confirm_until != None, User.pending_confirm_until <= now, User.accepted == False, User.banned_forever == False).all()
         temp, perm = [], []
         for u in expired:
             u.no_click_count = (u.no_click_count or 0) + 1
             u.pending_kick_until = None
+            if u.no_click_count >= 2:
+                u.banned_forever = True
+                perm.append(u.telegram_id)
+            else:
+                temp.append(u.telegram_id)
+        for u in confirm_expired:
+            u.no_click_count = (u.no_click_count or 0) + 1
+            u.pending_confirm_until = None
+            u.pending_confirm_branch = None
             if u.no_click_count >= 2:
                 u.banned_forever = True
                 perm.append(u.telegram_id)
