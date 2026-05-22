@@ -76,3 +76,29 @@ Elle ne touche pas à tes anciennes tables comme :
 - reward_links
 - referrals
 - etc.
+
+
+## V2 — logique ajoutée
+
+- Délai d'action après arrivée dans le groupe principal : 30 minutes par défaut.
+- Le message d'instruction dans le groupe principal est unique : le bot supprime le précédent avant d'envoyer le nouveau.
+- Si un utilisateur ne clique pas sur “Je suis intéressé” sous 30 minutes : kick + ban définitif.
+- Si un utilisateur clique NON : kick + ban définitif.
+- De 22h à 01h : aucun nouvel utilisateur ne peut rejoindre pour profiter de la récompense.
+- À 22h : les utilisateurs sans preuve du jour sont kick.
+- Première absence de preuve : retour autorisé une seule fois.
+- Deuxième absence de preuve : ban définitif.
+- Le bot rappelle chaque jour aux admins d’ajouter un lien récompense.
+- Le lien récompense est publié automatiquement vers 22h05.
+- À 01h : nouvelle session de preuves.
+- Au démarrage du bot : message admin indiquant que la session est active.
+
+## Variables optionnelles V2
+
+```env
+KICK_AFTER_MINUTES=30
+PROOF_DEADLINE_HOUR=22
+REWARD_START_HOUR=22
+LOCK_END_HOUR=1
+ADMIN_REWARD_REMINDER_HOUR=18
+```

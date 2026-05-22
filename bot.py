@@ -5,13 +5,11 @@ from datetime import datetime, timedelta, time
 from dotenv import load_dotenv
 from sqlalchemy import (
     create_engine, Column, Integer, BigInteger, String, Text, Boolean,
-    DateTime, func
+    DateTime, text as sql_text
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup
-)
-from telegram.constants import ChatType, ParseMode
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatType
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler,
     ChatMemberHandler, ContextTypes, filters
@@ -24,9 +22,11 @@ ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 PUBLIC_BIO_TAG = os.getenv("PUBLIC_BIO_TAG", "@antijavana").strip()
-KICK_AFTER_HOURS = int(os.getenv("KICK_AFTER_HOURS", "3"))
+KICK_AFTER_MINUTES = int(os.getenv("KICK_AFTER_MINUTES", "30"))
 PROOF_DEADLINE_HOUR = int(os.getenv("PROOF_DEADLINE_HOUR", "22"))
 REWARD_START_HOUR = int(os.getenv("REWARD_START_HOUR", "22"))
+LOCK_END_HOUR = int(os.getenv("LOCK_END_HOUR", "1"))
+ADMIN_REWARD_REMINDER_HOUR = int(os.getenv("ADMIN_REWARD_REMINDER_HOUR", "18"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN manquant")
@@ -83,6 +83,10 @@ class User(Base):
     accepted = Column(Boolean, default=False)
     last_proof_at = Column(DateTime, nullable=True)
     pending_kick_until = Column(DateTime, nullable=True)
+    proof_miss_count = Column(Integer, default=0)
+    banned_forever = Column(Boolean, default=False)
+    banned_reason = Column(Text, nullable=True)
+    last_private_notice_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -112,10 +116,28 @@ class Proof(Base):
     file_id = Column(String(255), nullable=True)
     caption = Column(Text, nullable=True)
     status = Column(String(50), default="pending")
+    session_date = Column(String(20), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
 Base.metadata.create_all(engine)
+
+
+def migrate():
+    # Safe migrations for users who already deployed the previous prefixed version.
+    statements = [
+        "ALTER TABLE antijavana_bot_users ADD COLUMN IF NOT EXISTS proof_miss_count INTEGER DEFAULT 0",
+        "ALTER TABLE antijavana_bot_users ADD COLUMN IF NOT EXISTS banned_forever BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE antijavana_bot_users ADD COLUMN IF NOT EXISTS banned_reason TEXT",
+        "ALTER TABLE antijavana_bot_users ADD COLUMN IF NOT EXISTS last_private_notice_at TIMESTAMP",
+        "ALTER TABLE antijavana_bot_proofs ADD COLUMN IF NOT EXISTS session_date VARCHAR(20)",
+    ]
+    with engine.begin() as conn:
+        for st in statements:
+            conn.execute(sql_text(st))
+
+
+migrate()
 
 
 def db():
@@ -124,6 +146,21 @@ def db():
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+def now_utc():
+    return datetime.utcnow()
+
+
+def today_key():
+    return now_utc().strftime("%Y-%m-%d")
+
+
+def is_reward_lock_time(dt=None) -> bool:
+    # Locked daily from 22:00 to 01:00 UTC/server time.
+    dt = dt or now_utc()
+    h = dt.hour
+    return h >= REWARD_START_HOUR or h < LOCK_END_HOUR
 
 
 def get_config(session, key: str, default: str = "") -> str:
@@ -228,6 +265,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not u:
             u = User(telegram_id=user.id, username=user.username, first_name=user.first_name)
             s.add(u)
+        if u.banned_forever:
+            s.commit()
+            await update.message.reply_text("Accès refusé.")
+            return
         u.redirected_private = True
         s.commit()
 
@@ -245,7 +286,7 @@ async def register_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
             s.add(g)
         else:
             g.title = chat.title
-            g.updated_at = datetime.utcnow()
+            g.updated_at = now_utc()
         s.commit()
 
 
@@ -259,7 +300,34 @@ async def my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             s.add(Group(chat_id=chat.id, title=chat.title, is_promo=False, is_active=True))
         else:
             g.title = chat.title
-            g.updated_at = datetime.utcnow()
+            g.updated_at = now_utc()
+        s.commit()
+
+
+async def delete_previous_central_instruction(context, central_chat_id: int):
+    with db() as s:
+        old_id = get_config(s, "central_instruction_message_id", "")
+    if old_id:
+        try:
+            await context.bot.delete_message(central_chat_id, int(old_id))
+        except Exception:
+            pass
+
+
+async def send_unique_central_instruction(context, central_chat_id: int, member_name: str = ""):
+    await delete_previous_central_instruction(context, central_chat_id)
+    text = (
+        f"Bonjour {member_name}.\n\n"
+        f"Pour rester ici et participer à la session du jour, continue en privé avec le bot.\n\n"
+        f"Tu as {KICK_AFTER_MINUTES} minutes pour cliquer."
+    )
+    msg = await context.bot.send_message(
+        central_chat_id,
+        text,
+        reply_markup=central_instruction_buttons()
+    )
+    with db() as s:
+        set_config(s, "central_instruction_message_id", str(msg.message_id))
         s.commit()
 
 
@@ -267,23 +335,43 @@ async def new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if not chat:
         return
+
     with db() as s:
         g = s.query(Group).filter_by(chat_id=chat.id).first()
         is_central = bool(g and g.is_central)
-        for member in update.message.new_chat_members:
+
+    if not is_central:
+        return
+
+    for member in update.message.new_chat_members:
+        with db() as s:
             u = s.query(User).filter_by(telegram_id=member.id).first()
             if not u:
                 u = User(telegram_id=member.id, username=member.username, first_name=member.first_name)
                 s.add(u)
-            if is_central:
-                u.joined_central_at = datetime.utcnow()
-                u.pending_kick_until = datetime.utcnow() + timedelta(hours=KICK_AFTER_HOURS)
-                await update.message.reply_text(
-                    f"Bonjour {member.first_name or ''}.\n\n"
-                    f"Pour rester ici, continue en privé avec le bot.",
-                    reply_markup=central_instruction_buttons()
-                )
-        s.commit()
+
+            if u.banned_forever:
+                s.commit()
+                await kick_from_central(context, member.id, permanent=True)
+                continue
+
+            # Nobody joins during reward window 22h-01h.
+            if is_reward_lock_time():
+                u.banned_forever = True
+                u.banned_reason = "Tentative de rejoindre pendant la fenêtre récompense 22h-01h"
+                s.commit()
+                try:
+                    await context.bot.send_message(member.id, "Le groupe est fermé entre 22h et 01h. Tu ne peux pas rejoindre pendant la distribution.")
+                except Exception:
+                    pass
+                await kick_from_central(context, member.id, permanent=True)
+                continue
+
+            u.joined_central_at = now_utc()
+            u.pending_kick_until = now_utc() + timedelta(minutes=KICK_AFTER_MINUTES)
+            s.commit()
+
+        await send_unique_central_instruction(context, chat.id, member.first_name or "")
 
 
 async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -292,7 +380,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = q.from_user
     data = q.data or ""
 
-    if data.startswith("admin:") or data.startswith("groups:") or data.startswith("ad:") or data.startswith("platform") or data.startswith("reward"):
+    if data.startswith(("admin:", "groups:", "ad:", "platform", "reward")):
         if not is_admin(user.id):
             await q.edit_message_text("Accès refusé.")
             return
@@ -328,19 +416,25 @@ async def handle_admin(q, context, data):
         return
 
     if data == "admin:proofs":
+        session = today_key()
         with db() as s:
-            pending = s.query(Proof).filter_by(status="pending").count()
-        await q.edit_message_text(f"✅ Preuves\n\nEn attente : {pending}", reply_markup=back_main())
+            pending = s.query(Proof).filter_by(session_date=session, status="pending").count()
+            accepted = s.query(User).filter_by(accepted=True, banned_forever=False).count()
+        await q.edit_message_text(
+            f"✅ Preuves session {session}\n\nUtilisateurs actifs : {accepted}\nPreuves reçues/en attente : {pending}",
+            reply_markup=back_main()
+        )
         return
 
     if data == "admin:stats":
         with db() as s:
             users = s.query(User).count()
-            accepted = s.query(User).filter_by(accepted=True).count()
+            accepted = s.query(User).filter_by(accepted=True, banned_forever=False).count()
+            banned = s.query(User).filter_by(banned_forever=True).count()
             groups = s.query(Group).count()
             promos = s.query(Group).filter_by(is_promo=True, is_active=True).count()
-            counts = {b: s.query(User).filter_by(branch=b, accepted=True).count() for b in BRANCHES}
-        txt = f"📊 Statistiques\n\nUtilisateurs : {users}\nAcceptés : {accepted}\nGroupes détectés : {groups}\nGroupes pub actifs : {promos}\n\n"
+            counts = {b: s.query(User).filter_by(branch=b, accepted=True, banned_forever=False).count() for b in BRANCHES}
+        txt = f"📊 Statistiques\n\nUtilisateurs : {users}\nActifs : {accepted}\nBannis définitifs : {banned}\nGroupes détectés : {groups}\nGroupes pub actifs : {promos}\n\n"
         txt += "\n".join(f"{BRANCH_LABELS[b]} : {c}" for b, c in counts.items())
         await q.edit_message_text(txt, reply_markup=back_main())
         return
@@ -404,17 +498,18 @@ async def handle_admin(q, context, data):
         txt += f"⭐ Principal : {central.title if central else 'non défini'}\n\n"
         txt += "📢 Groupes publicité actifs :\n"
         txt += "\n".join(f"- {g.title or g.chat_id}" for g in promos) if promos else "Aucun"
+        txt += f"\n\n🔒 Groupe fermé chaque jour de {REWARD_START_HOUR}h à {LOCK_END_HOUR}h."
         await q.edit_message_text(txt, reply_markup=groups_menu())
         return
 
     if data == "ad:set_text":
         context.user_data["admin_waiting"] = "ad_text"
-        await q.edit_message_text("✍️ Étape 1/1\n\nEnvoie le texte de publicité.\n\nTu pourras ensuite voir l’aperçu avant publication.")
+        await q.edit_message_text("✍️ Envoie le texte de publicité.")
         return
 
     if data == "ad:set_photo":
         context.user_data["admin_waiting"] = "ad_photo"
-        await q.edit_message_text("🖼 Étape 1/1\n\nEnvoie la photo de publicité.")
+        await q.edit_message_text("🖼 Envoie la photo de publicité.")
         return
 
     if data == "ad:preview":
@@ -431,14 +526,14 @@ async def handle_admin(q, context, data):
             row = s.query(BranchContent).filter_by(branch=branch).first()
             complete = bool(row and row.is_complete)
         await q.edit_message_text(
-            f"🌐 {BRANCH_LABELS[branch]}\n\nStatut : {'✅ complet' if complete else '⚠️ incomplet'}\n\nConfigure d’abord le texte, puis la photo, puis valide.",
+            f"🌐 {BRANCH_LABELS[branch]}\n\nStatut : {'✅ complet' if complete else '⚠️ incomplet'}\n\nConfigure le texte puis la photo.",
             reply_markup=platform_edit_menu(branch)
         )
         return
 
     if data == "platform:balance":
         with db() as s:
-            counts = {b: s.query(User).filter_by(branch=b, accepted=True).count() for b in BRANCHES}
+            counts = {b: s.query(User).filter_by(branch=b, accepted=True, banned_forever=False).count() for b in BRANCHES}
         txt = "📊 Répartition actuelle\n\n" + "\n".join(f"{BRANCH_LABELS[b]} : {c}" for b, c in counts.items())
         await q.edit_message_text(txt, reply_markup=platform_menu())
         return
@@ -446,13 +541,13 @@ async def handle_admin(q, context, data):
     if data.startswith("platform_text:"):
         branch = data.split(":")[-1]
         context.user_data["admin_waiting"] = f"platform_text:{branch}"
-        await q.edit_message_text(f"1️⃣ Étape texte — {BRANCH_LABELS[branch]}\n\nEnvoie maintenant les instructions texte.")
+        await q.edit_message_text(f"1️⃣ Texte — {BRANCH_LABELS[branch]}\n\nEnvoie les instructions.")
         return
 
     if data.startswith("platform_photo:"):
         branch = data.split(":")[-1]
         context.user_data["admin_waiting"] = f"platform_photo:{branch}"
-        await q.edit_message_text(f"2️⃣ Étape photo — {BRANCH_LABELS[branch]}\n\nEnvoie maintenant la photo associée.")
+        await q.edit_message_text(f"2️⃣ Photo — {BRANCH_LABELS[branch]}\n\nEnvoie la photo associée.")
         return
 
     if data.startswith("platform_preview:"):
@@ -466,10 +561,10 @@ async def handle_admin(q, context, data):
         with db() as s:
             row = s.query(BranchContent).filter_by(branch=branch).first()
             if not row or not row.instructions or not row.photo_file_id:
-                await q.edit_message_text("⚠️ Impossible de valider : il manque le texte ou la photo.", reply_markup=platform_edit_menu(branch))
+                await q.edit_message_text("⚠️ Il manque le texte ou la photo.", reply_markup=platform_edit_menu(branch))
                 return
             row.is_complete = True
-            row.updated_at = datetime.utcnow()
+            row.updated_at = now_utc()
             s.commit()
         await q.edit_message_text(f"✅ {BRANCH_LABELS[branch]} est complet.", reply_markup=platform_menu())
         return
@@ -487,16 +582,20 @@ async def handle_admin(q, context, data):
         await q.edit_message_text(txt, reply_markup=back_main())
         return
 
-    if data == "noop":
-        await q.answer("Ce groupe est le groupe principal.")
-        return
-
 
 async def handle_user_callback(q, context, data):
     user = q.from_user
 
     if data == "user:join":
+        if is_reward_lock_time():
+            await q.edit_message_text("Le groupe est fermé entre 22h et 01h. Reviens après 01h.")
+            return
+
         with db() as s:
+            u = s.query(User).filter_by(telegram_id=user.id).first()
+            if u and u.banned_forever:
+                await q.edit_message_text("Accès refusé.")
+                return
             central = s.query(Group).filter_by(is_central=True).first()
         if not central:
             await q.edit_message_text("Le groupe principal n’est pas encore configuré.")
@@ -515,6 +614,11 @@ async def handle_user_callback(q, context, data):
         return
 
     if data == "user:interested":
+        with db() as s:
+            u = s.query(User).filter_by(telegram_id=user.id).first()
+            if u and u.banned_forever:
+                await q.edit_message_text("Accès refusé.")
+                return
         try:
             await context.bot.send_message(user.id, "🎉 Félicitations.\n\nChoisis une plateforme :", reply_markup=platform_choice_buttons())
             with db() as s:
@@ -532,6 +636,10 @@ async def handle_user_callback(q, context, data):
     if data.startswith("user_branch:"):
         requested = data.split(":")[-1]
         with db() as s:
+            u = s.query(User).filter_by(telegram_id=user.id).first()
+            if u and u.banned_forever:
+                await q.edit_message_text("Accès refusé.")
+                return
             branch = choose_balanced_branch(s, requested)
             row = s.query(BranchContent).filter_by(branch=branch).first()
             instructions = row.instructions if row and row.instructions else f"Instructions pour {BRANCH_LABELS[branch]}."
@@ -552,6 +660,12 @@ async def handle_user_callback(q, context, data):
             if not u:
                 u = User(telegram_id=user.id, username=user.username, first_name=user.first_name)
                 s.add(u)
+
+            if u.banned_forever:
+                s.commit()
+                await q.edit_message_text("Accès refusé.")
+                return
+
             if ans == "yes":
                 u.branch = branch
                 u.accepted = True
@@ -561,13 +675,16 @@ async def handle_user_callback(q, context, data):
                 await q.edit_message_text("✅ Validé.\n\nEnvoie ta capture d’écran de preuve chaque jour avant 22h.")
             else:
                 u.accepted = False
+                u.banned_forever = True
+                u.banned_reason = "A cliqué NON à la confirmation"
                 s.commit()
-                await q.edit_message_text("❌ Refus enregistré.")
-                await kick_from_central(context, user.id)
+                await q.edit_message_text("❌ Refus enregistré. Accès bloqué.")
+                await kick_from_central(context, user.id, permanent=True)
+        return
 
 
 def choose_balanced_branch(session, requested):
-    counts = {b: session.query(User).filter_by(branch=b, accepted=True).count() for b in BRANCHES}
+    counts = {b: session.query(User).filter_by(branch=b, accepted=True, banned_forever=False).count() for b in BRANCHES}
     min_count = min(counts.values()) if counts else 0
     if counts.get(requested, 0) <= min_count + 1:
         return requested
@@ -589,6 +706,10 @@ async def send_ad_preview(chat_id, context, edit_message=None):
 
 
 async def publish_ad_to_promos(q, context):
+    if is_reward_lock_time():
+        await q.edit_message_text("🔒 Publication bloquée entre 22h et 01h.", reply_markup=groups_menu())
+        return
+
     with db() as s:
         promos = s.query(Group).filter_by(is_promo=True, is_active=True).all()
         text = get_config(s, "ad_text", "Si vous voulez recevoir 200 médias par jour, cliquez ci-dessous.")
@@ -653,13 +774,10 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 s.add(row)
             row.instructions = update.message.text
             row.is_complete = False
-            row.updated_at = datetime.utcnow()
+            row.updated_at = now_utc()
             s.commit()
             context.user_data.pop("admin_waiting", None)
-            await update.message.reply_text(
-                f"✅ Texte {BRANCH_LABELS[branch]} enregistré.\n\nPasse à l’étape 2 : ajoute la photo.",
-                reply_markup=platform_edit_menu(branch)
-            )
+            await update.message.reply_text(f"✅ Texte {BRANCH_LABELS[branch]} enregistré.\n\nPasse à la photo.", reply_markup=platform_edit_menu(branch))
             return
 
         if waiting.startswith("platform_photo:") and update.message.photo:
@@ -670,13 +788,10 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 s.add(row)
             row.photo_file_id = update.message.photo[-1].file_id
             row.is_complete = False
-            row.updated_at = datetime.utcnow()
+            row.updated_at = now_utc()
             s.commit()
             context.user_data.pop("admin_waiting", None)
-            await update.message.reply_text(
-                f"✅ Photo {BRANCH_LABELS[branch]} enregistrée.\n\nVérifie l’aperçu puis marque comme complet.",
-                reply_markup=platform_edit_menu(branch)
-            )
+            await update.message.reply_text(f"✅ Photo {BRANCH_LABELS[branch]} enregistrée.\n\nVérifie l’aperçu puis marque comme complet.", reply_markup=platform_edit_menu(branch))
             return
 
         if waiting == "reward_url" and update.message.text:
@@ -691,61 +806,116 @@ async def user_proof(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or is_admin(user.id):
         return
-    if update.message and update.message.photo:
-        with db() as s:
-            s.add(Proof(
-                user_id=user.id,
-                file_id=update.message.photo[-1].file_id,
-                caption=update.message.caption
-            ))
-            u = s.query(User).filter_by(telegram_id=user.id).first()
-            if u:
-                u.last_proof_at = datetime.utcnow()
-            s.commit()
-        await update.message.reply_text("✅ Preuve reçue.")
+    if not update.message or not update.message.photo:
+        return
+
+    with db() as s:
+        u = s.query(User).filter_by(telegram_id=user.id).first()
+        if not u or not u.accepted or u.banned_forever:
+            return
+
+        s.add(Proof(
+            user_id=user.id,
+            file_id=update.message.photo[-1].file_id,
+            caption=update.message.caption,
+            session_date=today_key()
+        ))
+        u.last_proof_at = now_utc()
+        s.commit()
+
+    await update.message.reply_text("✅ Preuve reçue pour la session du jour.")
 
 
-async def kick_from_central(context, user_id):
+async def kick_from_central(context, user_id, permanent=False):
     with db() as s:
         central = s.query(Group).filter_by(is_central=True).first()
     if not central:
         return
     try:
         await context.bot.ban_chat_member(central.chat_id, user_id)
-        await context.bot.unban_chat_member(central.chat_id, user_id)
+        if not permanent:
+            await context.bot.unban_chat_member(central.chat_id, user_id)
     except Exception:
         pass
 
 
 async def scheduled_kicks(context):
-    now = datetime.utcnow()
+    now = now_utc()
     with db() as s:
         expired = s.query(User).filter(
             User.pending_kick_until != None,
             User.pending_kick_until <= now,
-            User.accepted == False
+            User.accepted == False,
+            User.banned_forever == False
         ).all()
-        ids = [u.telegram_id for u in expired]
+        ids = []
         for u in expired:
+            u.banned_forever = True
+            u.banned_reason = "N’a pas cliqué sur Je suis intéressé sous 30 minutes"
             u.pending_kick_until = None
+            ids.append(u.telegram_id)
         s.commit()
+
     for uid in ids:
-        await kick_from_central(context, uid)
+        try:
+            await context.bot.send_message(uid, "Tu n’as pas validé dans le délai. Accès bloqué.")
+        except Exception:
+            pass
+        await kick_from_central(context, uid, permanent=True)
 
 
-async def daily_reminder(context):
-    today = datetime.utcnow().date()
+async def proof_deadline_check(context):
+    # At 22:00, kick users without proof. They may return once only.
+    session = today_key()
     with db() as s:
-        users = s.query(User).filter_by(accepted=True).all()
-    for u in users:
-        if not u.last_proof_at or u.last_proof_at.date() < today:
-            try:
-                await context.bot.send_message(u.telegram_id, "⏰ Rappel : envoie ta preuve avant 22h.")
-            except Exception:
-                pass
+        active = s.query(User).filter_by(accepted=True, banned_forever=False).all()
+        central = s.query(Group).filter_by(is_central=True).first()
+
+        to_kick_temp = []
+        to_ban_perm = []
+
+        for u in active:
+            has_proof = s.query(Proof).filter_by(user_id=u.telegram_id, session_date=session).first()
+            if has_proof:
+                continue
+
+            u.accepted = False
+            u.branch = None
+            u.pending_kick_until = None
+            u.proof_miss_count = (u.proof_miss_count or 0) + 1
+
+            if u.proof_miss_count >= 2:
+                u.banned_forever = True
+                u.banned_reason = "Deuxième absence de preuve avant 22h"
+                to_ban_perm.append(u.telegram_id)
+            else:
+                to_kick_temp.append(u.telegram_id)
+
+        s.commit()
+
+    for uid in to_kick_temp:
+        try:
+            await context.bot.send_message(
+                uid,
+                "Tu n’as pas envoyé ta preuve avant 22h. Tu as été retiré du groupe. Tu peux revenir une seule fois et refaire le processus."
+            )
+        except Exception:
+            pass
+        await kick_from_central(context, uid, permanent=False)
+
+    for uid in to_ban_perm:
+        try:
+            await context.bot.send_message(
+                uid,
+                "Tu n’as pas envoyé ta preuve une deuxième fois. Accès définitivement bloqué."
+            )
+        except Exception:
+            pass
+        await kick_from_central(context, uid, permanent=True)
 
 
 async def publish_reward(context):
+    # Reward is published once daily in 22h-01h window, then next session starts after 01h.
     with db() as s:
         central = s.query(Group).filter_by(is_central=True).first()
         reward = s.query(Reward).filter_by(active=True, published=False).order_by(Reward.created_at.asc()).first()
@@ -754,10 +924,47 @@ async def publish_reward(context):
         url = reward.url
         reward.published = True
         s.commit()
+
     try:
         await context.bot.send_message(central.chat_id, f"🎁 Récompense du jour :\n{url}")
     except Exception:
         pass
+
+
+async def admin_reward_reminder(context):
+    with db() as s:
+        pending = s.query(Reward).filter_by(active=True, published=False).count()
+    msg = f"⏰ Rappel quotidien : ajoute un nouveau lien récompense pour ce soir.\nLiens en attente : {pending}"
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(admin_id, msg)
+        except Exception:
+            pass
+
+
+async def open_new_session(context):
+    # At 01:00, reset the central instruction message and tell active users the new proof session started.
+    with db() as s:
+        set_config(s, "central_instruction_message_id", "")
+        users = s.query(User).filter_by(accepted=True, banned_forever=False).all()
+        s.commit()
+    for u in users:
+        try:
+            await context.bot.send_message(u.telegram_id, "Nouvelle session ouverte. Envoie ta preuve du jour avant 22h.")
+        except Exception:
+            pass
+
+
+async def boot_session_message(context):
+    # t=0 after deploy: notify admins that the proof session is active.
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                admin_id,
+                "✅ Bot démarré. Session de preuves active. Les utilisateurs devront envoyer leur capture avant 22h."
+            )
+        except Exception:
+            pass
 
 
 def main():
@@ -771,11 +978,15 @@ def main():
     app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & filters.ChatType.PRIVATE, admin_input), group=2)
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, user_proof), group=3)
 
-    app.job_queue.run_repeating(scheduled_kicks, interval=300, first=30)
-    app.job_queue.run_daily(daily_reminder, time=time(hour=max(PROOF_DEADLINE_HOUR - 1, 0), minute=0))
-    app.job_queue.run_daily(publish_reward, time=time(hour=REWARD_START_HOUR, minute=0))
+    app.job_queue.run_once(boot_session_message, when=5)
+    app.job_queue.run_repeating(scheduled_kicks, interval=120, first=30)
 
-    print("Bot pro PostgreSQL démarré avec tables isolées antijavana_bot_*.")
+    app.job_queue.run_daily(admin_reward_reminder, time=time(hour=ADMIN_REWARD_REMINDER_HOUR, minute=0))
+    app.job_queue.run_daily(proof_deadline_check, time=time(hour=PROOF_DEADLINE_HOUR, minute=0))
+    app.job_queue.run_daily(publish_reward, time=time(hour=REWARD_START_HOUR, minute=5))
+    app.job_queue.run_daily(open_new_session, time=time(hour=LOCK_END_HOUR, minute=0))
+
+    print("Bot V2 PostgreSQL démarré avec tables isolées antijavana_bot_*. Lock 22h-01h, preuves quotidiennes, bans.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
