@@ -1,40 +1,43 @@
-
-# Telegram Railway Promo Bot
-
-Bot Telegram en Python avec :
-- panel admin 100% boutons
-- détection automatique des groupes où le bot est ajouté
-- configuration pub/photo/instructions/lien récompense depuis Telegram
-- groupe central configurable depuis le panel
-- choix TikTok / Leakmedia / Reddit / Discord avec répartition équilibrée
-- confirmation OUI/NON
-- kick après 3h si l'utilisateur ne confirme pas
-- demande/preuve quotidienne avant 22h
-- publication de la récompense dans le groupe central
+# Telegram Railway Bot — Production PostgreSQL
 
 ## Variables Railway obligatoires
 
-- `BOT_TOKEN` : token donné par @BotFather
-- `ADMIN_IDS` : ton id Telegram numérique, ex: `123456789`
-- `TZ` : optionnel, par défaut `Europe/Paris`
-- `REQUIRED_BIO` : optionnel, par défaut `@antijavana`
+```env
+BOT_TOKEN=ton_token_botfather
+ADMIN_IDS=123456789
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+```
 
-Tu n’as pas besoin de mettre les chat_id des groupes en variable. Le bot les détecte automatiquement quand il est ajouté dans les groupes ou quand un message y est envoyé.
+## Variables optionnelles
+
+```env
+PUBLIC_BIO_TAG=@antijavana
+PROOF_DEADLINE_HOUR=22
+REWARD_START_HOUR=22
+REWARD_END_HOUR=1
+KICK_AFTER_HOURS=3
+```
 
 ## Installation Railway
 
-1. Mets ces fichiers dans un repo GitHub.
-2. Sur Railway : New Project -> Deploy from GitHub.
-3. Ajoute les variables `BOT_TOKEN` et `ADMIN_IDS`.
-4. Déploie.
-5. Ajoute le bot dans tes groupes avec les droits admin :
-   - supprimer/bannir des membres
-   - envoyer messages
-   - lire messages de service
-6. Lance `/start` en privé avec le bot.
-7. Va dans `Groupes`, choisis le groupe central.
-8. Configure les textes/photos/liens depuis le panel.
+1. Crée un projet Railway.
+2. Ajoute un service PostgreSQL Railway.
+3. Ajoute ce code comme service bot.
+4. Dans Variables du service bot, ajoute :
+   - `BOT_TOKEN`
+   - `ADMIN_IDS`
+   - `DATABASE_URL` en référence au PostgreSQL Railway : `${{Postgres.DATABASE_URL}}`
+5. Déploie.
+6. Va sur Telegram, ouvre le bot, envoie `/start`.
+
+## Permissions Telegram nécessaires
+
+Dans les groupes, le bot doit être admin avec :
+- bannir des membres
+- inviter via lien
+- gérer les messages, optionnel
 
 ## Important
 
-Telegram ne donne pas toujours la bio publique d’un utilisateur via la Bot API. Le code essaie de vérifier `REQUIRED_BIO`, mais si Telegram ne retourne pas la bio, l’utilisateur passe en `bio_unknown`. Si tu veux un contrôle strict à 100%, il faut ajouter une validation admin manuelle ou demander une preuve.
+La Bot API Telegram ne garantit pas l'accès à la bio publique de tous les utilisateurs.
+Le bot prévoit donc un champ `PUBLIC_BIO_TAG` et une logique de validation côté workflow, mais Telegram peut limiter cette vérification automatiquement.
