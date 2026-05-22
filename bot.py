@@ -759,7 +759,7 @@ async def handle_user_callback(q, context, data):
             await q.edit_message_text("Le groupe principal n’est pas configuré.")
             return
         try:
-            invite = await context.bot.create_chat_invite_link(chat_id=central.chat_id, member_limit=1, creates_join_request=True)
+            invite = await context.bot.create_chat_invite_link(chat_id=central.chat_id, creates_join_request=True)
             await q.edit_message_text(
                 f"Mets {PUBLIC_BIO_TAG} dans ta bio publique puis demande l’accès :",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚪 Envoyer une demande", url=invite.invite_link)]])
