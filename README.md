@@ -1,4 +1,17 @@
-# Telegram Railway Bot — Production PostgreSQL
+# Telegram Railway Bot Pro — PostgreSQL
+
+Version plus propre :
+- panel admin 100% boutons
+- groupes détectés automatiquement
+- choix clair du groupe principal
+- activation/désactivation des groupes publicité
+- publication pub dans tous les groupes promo actifs
+- configuration des plateformes en 2 étapes : texte puis photo
+- aperçu avant validation
+- PostgreSQL Railway persistant
+- kick automatique après délai
+- preuves quotidiennes
+- récompenses publiées par le bot
 
 ## Variables Railway obligatoires
 
@@ -12,32 +25,29 @@ DATABASE_URL=${{Postgres.DATABASE_URL}}
 
 ```env
 PUBLIC_BIO_TAG=@antijavana
+KICK_AFTER_HOURS=3
 PROOF_DEADLINE_HOUR=22
 REWARD_START_HOUR=22
-REWARD_END_HOUR=1
-KICK_AFTER_HOURS=3
 ```
 
-## Installation Railway
+## Déploiement
 
 1. Crée un projet Railway.
-2. Ajoute un service PostgreSQL Railway.
-3. Ajoute ce code comme service bot.
-4. Dans Variables du service bot, ajoute :
-   - `BOT_TOKEN`
-   - `ADMIN_IDS`
-   - `DATABASE_URL` en référence au PostgreSQL Railway : `${{Postgres.DATABASE_URL}}`
+2. Ajoute PostgreSQL.
+3. Ajoute ce service bot.
+4. Mets les variables.
 5. Déploie.
-6. Va sur Telegram, ouvre le bot, envoie `/start`.
+6. Va sur Telegram → `/start`.
 
-## Permissions Telegram nécessaires
+## Permissions Telegram
 
-Dans les groupes, le bot doit être admin avec :
+Le bot doit être admin dans les groupes avec :
 - bannir des membres
 - inviter via lien
-- gérer les messages, optionnel
+- envoyer messages
+- gérer les messages si besoin
 
-## Important
+## Note importante
 
-La Bot API Telegram ne garantit pas l'accès à la bio publique de tous les utilisateurs.
-Le bot prévoit donc un champ `PUBLIC_BIO_TAG` et une logique de validation côté workflow, mais Telegram peut limiter cette vérification automatiquement.
+Telegram ne donne pas toujours accès à la bio publique d’un utilisateur via la Bot API.
+La vérification `@antijavana` peut donc nécessiter une validation manuelle ou un système de preuve.
