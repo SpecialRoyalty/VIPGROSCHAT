@@ -1,7 +1,7 @@
 
 import os
 import random
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time, UTC
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, Column, Integer, BigInteger, String, Text, Boolean, DateTime, text as sql_text
@@ -172,7 +172,7 @@ def db():
 
 
 def now_utc():
-    return datetime.utcnow()
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 def today_key():
