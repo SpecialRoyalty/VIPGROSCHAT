@@ -1,6 +1,6 @@
 # Telegram Railway Bot Pro — PostgreSQL
 
-Version plus propre :
+Version plus propre avec tables isolées `antijavana_bot_*`, sans conflit avec une base PostgreSQL déjà utilisée :
 - panel admin 100% boutons
 - groupes détectés automatiquement
 - choix clair du groupe principal
@@ -51,3 +51,28 @@ Le bot doit être admin dans les groupes avec :
 
 Telegram ne donne pas toujours accès à la bio publique d’un utilisateur via la Bot API.
 La vérification `@antijavana` peut donc nécessiter une validation manuelle ou un système de preuve.
+
+
+## Tables créées par cette version
+
+Cette version utilise uniquement des tables avec le préfixe :
+
+```text
+antijavana_bot_
+```
+
+Tables utilisées :
+- antijavana_bot_config
+- antijavana_bot_groups
+- antijavana_bot_users
+- antijavana_bot_branch_content
+- antijavana_bot_rewards
+- antijavana_bot_proofs
+
+Elle ne touche pas à tes anciennes tables comme :
+- participants
+- settings
+- messages
+- reward_links
+- referrals
+- etc.

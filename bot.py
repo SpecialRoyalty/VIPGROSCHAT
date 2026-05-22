@@ -54,13 +54,13 @@ BRANCH_LABELS = {
 
 
 class Config(Base):
-    __tablename__ = "config"
+    __tablename__ = "antijavana_bot_config"
     key = Column(String(100), primary_key=True)
     value = Column(Text, nullable=True)
 
 
 class Group(Base):
-    __tablename__ = "groups"
+    __tablename__ = "antijavana_bot_groups"
     id = Column(Integer, primary_key=True)
     chat_id = Column(BigInteger, unique=True, index=True, nullable=False)
     title = Column(String(255), nullable=True)
@@ -72,7 +72,7 @@ class Group(Base):
 
 
 class User(Base):
-    __tablename__ = "users"
+    __tablename__ = "antijavana_bot_users"
     id = Column(Integer, primary_key=True)
     telegram_id = Column(BigInteger, unique=True, index=True, nullable=False)
     username = Column(String(255), nullable=True)
@@ -87,7 +87,7 @@ class User(Base):
 
 
 class BranchContent(Base):
-    __tablename__ = "branch_content"
+    __tablename__ = "antijavana_bot_branch_content"
     id = Column(Integer, primary_key=True)
     branch = Column(String(50), unique=True, nullable=False)
     instructions = Column(Text, nullable=True)
@@ -97,7 +97,7 @@ class BranchContent(Base):
 
 
 class Reward(Base):
-    __tablename__ = "rewards"
+    __tablename__ = "antijavana_bot_rewards"
     id = Column(Integer, primary_key=True)
     url = Column(Text, nullable=False)
     active = Column(Boolean, default=True)
@@ -106,7 +106,7 @@ class Reward(Base):
 
 
 class Proof(Base):
-    __tablename__ = "proofs"
+    __tablename__ = "antijavana_bot_proofs"
     id = Column(Integer, primary_key=True)
     user_id = Column(BigInteger, index=True, nullable=False)
     file_id = Column(String(255), nullable=True)
@@ -775,7 +775,7 @@ def main():
     app.job_queue.run_daily(daily_reminder, time=time(hour=max(PROOF_DEADLINE_HOUR - 1, 0), minute=0))
     app.job_queue.run_daily(publish_reward, time=time(hour=REWARD_START_HOUR, minute=0))
 
-    print("Bot pro PostgreSQL démarré.")
+    print("Bot pro PostgreSQL démarré avec tables isolées antijavana_bot_*.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
