@@ -166,3 +166,15 @@ Colonnes ajoutées :
 - À 18h, le bot mentionne les membres qui n’ont pas encore envoyé leur preuve.
 - Le message de rappel ne donne pas l’heure exacte de kick.
 - Chaque photo envoyée au bot reçoit : `✅ Preuve prise en compte.`
+
+
+## Modération groupe principal
+
+Ajouté :
+- suppression automatique des notifications d’entrée/sortie dans le groupe principal
+- panel admin `🚫 Mots interdits`
+- les mots interdits ne s’appliquent qu’au groupe principal
+- si un message contient un mot interdit, le bot le supprime
+
+Permission nécessaire dans le groupe principal :
+- supprimer messages

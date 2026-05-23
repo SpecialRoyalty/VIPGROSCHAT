@@ -215,6 +215,22 @@ def get_user(s, tg_user):
     return u
 
 
+def parse_bad_words(raw):
+    return [w.strip().lower() for w in (raw or "").replace(",", "\n").splitlines() if w.strip()]
+
+
+def is_main_group(chat_id):
+    with db() as s:
+        main_id = get_config(s, "main_group_id", "")
+    return bool(main_id and str(chat_id) == str(main_id))
+
+
+def text_contains_bad_word(text, words):
+    lower = (text or "").lower()
+    return any(w in lower for w in words)
+
+
+
 def reward_start_dt():
     n = now()
     return n.replace(hour=REWARD_HOUR, minute=REWARD_MINUTE, second=0, microsecond=0)
@@ -295,6 +311,7 @@ def admin_menu():
         [InlineKeyboardButton("🌐 Plateformes", callback_data="admin:platforms")],
         [InlineKeyboardButton("🎁 Ajouter récompense", callback_data="admin:reward")],
         [InlineKeyboardButton("📜 Modifier règles", callback_data="admin:rules")],
+        [InlineKeyboardButton("🚫 Mots interdits", callback_data="admin:badwords")],
         [InlineKeyboardButton("📊 Stats", callback_data="admin:stats")],
     ])
 
@@ -516,7 +533,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = q.from_user
     data = q.data or ""
 
-    if data.startswith("admin:") or data.startswith("admbranch:") or data.startswith("ad:") or data.startswith("proofadmin:"):
+    if data.startswith("admin:") or data.startswith("admbranch:") or data.startswith("ad:") or data.startswith("proofadmin:") or data.startswith("badwords:"):
         if not is_admin(user.id):
             await safe_edit(q, "Accès refusé.")
             return
@@ -754,6 +771,30 @@ async def admin_callback(q, context, data):
         await safe_edit(q, "Envoie maintenant le texte complet des règles.")
         return
 
+    if data == "admin:badwords":
+        with db() as s:
+            words = get_config(s, "bad_words", "")
+        shown = words if words else "Aucun mot interdit configuré."
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✍️ Modifier la liste", callback_data="badwords:set")],
+            [InlineKeyboardButton("🧹 Vider la liste", callback_data="badwords:clear")],
+            [InlineKeyboardButton("⬅️ Menu", callback_data="admin:menu")]
+        ])
+        await safe_edit(q, f"🚫 Mots interdits groupe principal uniquement\n\nListe actuelle :\n{shown}", reply_markup=kb)
+        return
+
+    if data == "badwords:set":
+        context.user_data["admin_waiting"] = "bad_words"
+        await safe_edit(q, "Envoie la liste des mots interdits.\n\nUn mot par ligne, ou séparés par des virgules.")
+        return
+
+    if data == "badwords:clear":
+        with db() as s:
+            set_config(s, "bad_words", "")
+            s.commit()
+        await safe_edit(q, "✅ Liste des mots interdits vidée.", reply_markup=admin_menu())
+        return
+
     if data == "admin:stats":
         with db() as s:
             users = s.query(User).count()
@@ -787,6 +828,13 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             s.commit()
             context.user_data.pop("admin_waiting", None)
             await update.message.reply_text("✅ Photo publicité enregistrée.", reply_markup=admin_menu())
+            return
+
+        if waiting == "bad_words" and update.message.text:
+            set_config(s, "bad_words", update.message.text.strip())
+            s.commit()
+            context.user_data.pop("admin_waiting", None)
+            await update.message.reply_text("✅ Mots interdits enregistrés.", reply_markup=admin_menu())
             return
 
         if waiting == "rules_text" and update.message.text:
@@ -897,6 +945,53 @@ async def send_ad_preview(context, chat_id):
     else:
         await context.bot.send_message(chat_id, text, reply_markup=kb)
 
+
+
+async def cleanup_service_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Supprime les notifications d'entrée/sortie uniquement dans le groupe principal."""
+    chat = update.effective_chat
+    msg = update.message
+    if not chat or not msg or not is_main_group(chat.id):
+        return
+
+    if (
+        msg.new_chat_members
+        or msg.left_chat_member
+        or msg.group_chat_created
+        or msg.supergroup_chat_created
+        or msg.channel_chat_created
+        or msg.migrate_to_chat_id
+        or msg.migrate_from_chat_id
+        or msg.pinned_message
+    ):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+
+async def moderate_bad_words(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Supprime les messages contenant des mots interdits uniquement dans le groupe principal."""
+    chat = update.effective_chat
+    msg = update.message
+    if not chat or not msg or not is_main_group(chat.id):
+        return
+
+    text = msg.text or msg.caption or ""
+    if not text:
+        return
+
+    with db() as s:
+        words = parse_bad_words(get_config(s, "bad_words", ""))
+
+    if not words:
+        return
+
+    if text_contains_bad_word(text, words):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
 
 async def publish_ad(context):
     with db() as s:
@@ -1119,6 +1214,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler(["setmain", "addpromo", "panel"], admin_commands))
     app.add_handler(CallbackQueryHandler(callbacks))
+    app.add_handler(MessageHandler(filters.StatusUpdate.ALL, cleanup_service_messages), group=-2)
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, moderate_bad_words), group=-1)
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, main_group_join))
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, receive_proof), group=1)
     app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & filters.ChatType.PRIVATE, admin_input), group=2)
