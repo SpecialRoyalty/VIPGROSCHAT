@@ -101,6 +101,16 @@ class Proof(Base):
     file_id = Column(String(255), nullable=False)
     proof_date = Column(Date, index=True, nullable=False)
     kind = Column(String(50), default="daily")
+    status = Column(String(50), default="pending")  # pending / accepted / refused
+    created_at = Column(DateTime, default=lambda: datetime.now(UTC).replace(tzinfo=None))
+
+
+class AdminProofMessage(Base):
+    __tablename__ = "ajv2_admin_proof_messages"
+    id = Column(Integer, primary_key=True)
+    proof_id = Column(Integer, index=True, nullable=False)
+    admin_id = Column(BigInteger, index=True, nullable=False)
+    message_id = Column(BigInteger, nullable=False)
     created_at = Column(DateTime, default=lambda: datetime.now(UTC).replace(tzinfo=None))
 
 
@@ -131,6 +141,14 @@ def migrate():
         "ALTER TABLE ajv2_rewards ADD COLUMN IF NOT EXISTS message_id BIGINT",
         "ALTER TABLE ajv2_rewards ADD COLUMN IF NOT EXISTS published_at TIMESTAMP",
         "ALTER TABLE ajv2_rewards ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP",
+        "ALTER TABLE ajv2_proofs ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'pending'",
+        """CREATE TABLE IF NOT EXISTS ajv2_admin_proof_messages (
+            id SERIAL PRIMARY KEY,
+            proof_id INTEGER NOT NULL,
+            admin_id BIGINT NOT NULL,
+            message_id BIGINT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        )""",
     ]
     with engine.begin() as conn:
         for stmt in stmts:
@@ -279,6 +297,81 @@ async def is_channel_member(context, user_id):
         return False
 
 
+def branch_loads(session):
+    """Compte les utilisateurs validés ou en attente de preuve par branche."""
+    loads = {}
+    for b in BRANCHES:
+        loads[b] = session.query(User).filter(
+            User.branch == b,
+            User.banned == False,
+            (User.validated == True) | (User.waiting_first_proof == True)
+        ).count()
+    return loads
+
+
+def choose_balanced_branch(session, requested):
+    loads = branch_loads(session)
+    min_load = min(loads.values()) if loads else 0
+    requested_load = loads.get(requested, 0)
+
+    # Si la branche demandée a plus d'1 utilisateur d'écart avec la moins remplie,
+    # on attribue automatiquement une branche plus faible.
+    if requested_load <= min_load + 1:
+        return requested
+
+    candidates = [b for b, c in loads.items() if c == min_load]
+    return candidates[0] if candidates else requested
+
+
+async def delete_admin_proof_messages(context, proof_id):
+    with db() as s:
+        rows = s.query(AdminProofMessage).filter_by(proof_id=proof_id).all()
+        copies = [(r.admin_id, r.message_id) for r in rows]
+
+    for admin_id, message_id in copies:
+        try:
+            await context.bot.delete_message(chat_id=admin_id, message_id=message_id)
+        except Exception:
+            pass
+
+    with db() as s:
+        s.query(AdminProofMessage).filter_by(proof_id=proof_id).delete()
+        s.commit()
+
+
+async def send_proof_to_admins(context, proof_id):
+    with db() as s:
+        proof = s.query(Proof).filter_by(id=proof_id).first()
+        user = s.query(User).filter_by(telegram_id=proof.telegram_id).first() if proof else None
+        if not proof or not user:
+            return
+
+    caption = (
+        f"📸 Nouvelle preuve à valider\n\n"
+        f"Type : {proof.kind}\n"
+        f"Branche : {user.branch or 'non définie'}\n"
+        f"User ID : {user.telegram_id}\n"
+        f"Username : @{user.username or 'aucun'}\n"
+        f"Nom : {user.first_name or ''}"
+    )
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Accepter", callback_data=f"proofadmin:accept:{proof_id}"),
+            InlineKeyboardButton("❌ Refuser", callback_data=f"proofadmin:refuse:{proof_id}")
+        ]
+    ])
+
+    for admin_id in ADMIN_IDS:
+        try:
+            msg = await context.bot.send_photo(admin_id, photo=proof.file_id, caption=caption, reply_markup=kb)
+            with db() as s:
+                s.add(AdminProofMessage(proof_id=proof_id, admin_id=admin_id, message_id=msg.message_id))
+                s.commit()
+        except Exception:
+            pass
+
+
 async def safe_edit(q, text, reply_markup=None):
     try:
         await q.edit_message_text(text, reply_markup=reply_markup)
@@ -389,7 +482,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = q.from_user
     data = q.data or ""
 
-    if data.startswith("admin:") or data.startswith("admbranch:") or data.startswith("ad:"):
+    if data.startswith("admin:") or data.startswith("admbranch:") or data.startswith("ad:") or data.startswith("proofadmin:"):
         if not is_admin(user.id):
             await safe_edit(q, "Accès refusé.")
             return
@@ -429,13 +522,35 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("branch:"):
-        branch = data.split(":")[1]
+        requested = data.split(":")[1]
         with db() as s:
             u = get_user(s, user)
+
+            # Une branche est verrouillée dès qu'elle est attribuée.
+            # L'utilisateur ne peut changer que si un admin refuse sa preuve.
+            if u.branch and (u.waiting_first_proof or u.validated):
+                locked = u.branch
+                s.commit()
+                await safe_edit(
+                    q,
+                    f"Tu as déjà une branche attribuée : {BRANCH_LABELS.get(locked, locked)}.\n\n"
+                    "Envoie ta preuve ou attends la décision admin."
+                )
+                return
+
+            branch = choose_balanced_branch(s, requested)
             u.branch = branch
             u.waiting_first_proof = True
             s.commit()
-        await safe_edit(q, "Je t’envoie les instructions.")
+
+        if branch != requested:
+            await safe_edit(
+                q,
+                f"Pour garder les groupes équilibrés, ta branche attribuée est : {BRANCH_LABELS[branch]}.\n\nJe t’envoie les instructions."
+            )
+        else:
+            await safe_edit(q, "Je t’envoie les instructions.")
+
         await send_platform_content(context, user.id, branch)
         return
 
@@ -445,6 +560,71 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def admin_callback(q, context, data):
+    if data.startswith("proofadmin:"):
+        _, action, proof_id_raw = data.split(":")
+        proof_id = int(proof_id_raw)
+
+        with db() as s:
+            proof = s.query(Proof).filter_by(id=proof_id).first()
+            if not proof:
+                await safe_edit(q, "Preuve introuvable.")
+                return
+
+            u = s.query(User).filter_by(telegram_id=proof.telegram_id).first()
+            if not u:
+                await safe_edit(q, "Utilisateur introuvable.")
+                return
+
+            if proof.status != "pending":
+                await delete_admin_proof_messages(context, proof_id)
+                try:
+                    await q.message.delete()
+                except Exception:
+                    pass
+                return
+
+            if action == "accept":
+                proof.status = "accepted"
+                u.proof_miss_count = 0
+
+                if proof.kind == "first":
+                    u.waiting_first_proof = False
+                    u.validated = True
+
+                s.commit()
+
+                await delete_admin_proof_messages(context, proof_id)
+                try:
+                    await context.bot.send_message(u.telegram_id, "✅ Ta preuve a été acceptée.")
+                except Exception:
+                    pass
+
+                if proof.kind == "first":
+                    await send_invite(context, u.telegram_id)
+                return
+
+            if action == "refuse":
+                proof.status = "refused"
+
+                # Refus première preuve : l'utilisateur doit recommencer.
+                # On libère la branche pour qu'il repasse par le parcours.
+                if proof.kind == "first":
+                    u.waiting_first_proof = False
+                    u.validated = False
+                    u.branch = None
+
+                s.commit()
+
+                await delete_admin_proof_messages(context, proof_id)
+                try:
+                    await context.bot.send_message(
+                        u.telegram_id,
+                        "❌ Ta preuve a été refusée. Tu dois recommencer le parcours avec /start."
+                    )
+                except Exception:
+                    pass
+                return
+
     if data == "admin:menu":
         await safe_edit(q, "🛠 Panel admin", reply_markup=admin_menu())
         return
@@ -581,16 +761,23 @@ async def receive_proof(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if u.banned:
             s.commit()
             return
+
         kind = "first" if u.waiting_first_proof and not u.validated else "daily"
-        s.add(Proof(telegram_id=user.id, file_id=update.message.photo[-1].file_id, proof_date=today(), kind=kind))
-        u.waiting_first_proof = False
-        u.validated = True
-        u.proof_miss_count = 0
+
+        proof = Proof(
+            telegram_id=user.id,
+            file_id=update.message.photo[-1].file_id,
+            proof_date=today(),
+            kind=kind,
+            status="pending"
+        )
+        s.add(proof)
+        s.flush()
+        proof_id = proof.id
         s.commit()
 
-    await update.message.reply_text("✅ Preuve reçue.")
-    if kind == "first":
-        await send_invite(context, user.id)
+    await update.message.reply_text("✅ Preuve reçue. Elle est envoyée aux admins pour validation.")
+    await send_proof_to_admins(context, proof_id)
 
 
 async def main_group_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -662,7 +849,7 @@ async def proof_deadline_job(context):
 
     for u in users:
         with db() as s:
-            has = s.query(Proof).filter_by(telegram_id=u.telegram_id, proof_date=today()).first()
+            has = s.query(Proof).filter_by(telegram_id=u.telegram_id, proof_date=today(), status="accepted").first()
             uu = s.query(User).filter_by(telegram_id=u.telegram_id).first()
             if has or not uu:
                 continue

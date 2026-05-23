@@ -97,3 +97,40 @@ Si tu veux désactiver la vérification canal temporairement :
 ```env
 REQUIRE_CHANNEL_JOIN=false
 ```
+
+
+## Validation admin des preuves
+
+Quand un utilisateur envoie une capture :
+- elle est envoyée aux admins
+- boutons : ✅ Accepter / ❌ Refuser
+
+Si accepté :
+- preuve validée
+- si première preuve : lien unique 10 min / 1 usage envoyé
+
+Si refusé :
+- l'utilisateur recommence avec /start
+- la branche est libérée
+
+## Verrouillage branche
+
+Une fois qu'une branche est attribuée, l'utilisateur ne peut plus changer.
+Il peut changer uniquement si sa preuve est refusée par un admin.
+
+## Rééquilibrage automatique
+
+Au moment du choix, le bot compte les utilisateurs validés ou en attente dans chaque branche.
+Si la branche demandée est trop chargée, le bot attribue automatiquement la branche la moins remplie.
+
+
+## Nettoyage automatique des preuves admin
+
+Quand un admin clique sur ✅ Accepter ou ❌ Refuser :
+- la décision est enregistrée une seule fois
+- les messages de validation sont supprimés chez tous les admins
+- si un autre admin clique trop tard, son message est aussi supprimé
+- cela évite la surcharge dans les conversations admin
+
+Table ajoutée :
+- `ajv2_admin_proof_messages`
