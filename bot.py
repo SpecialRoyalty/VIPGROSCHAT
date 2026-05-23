@@ -70,6 +70,8 @@ class User(Base):
     validated = Column(Boolean, default=False)
     joined_main = Column(Boolean, default=False)
     proof_miss_count = Column(Integer, default=0)
+    restart_count = Column(Integer, default=0)
+    rules_accepted = Column(Boolean, default=False)
     banned = Column(Boolean, default=False)
     banned_reason = Column(Text)
     created_at = Column(DateTime, default=lambda: datetime.now(UTC).replace(tzinfo=None))
@@ -137,6 +139,8 @@ def migrate():
         "ALTER TABLE ajv2_users ADD COLUMN IF NOT EXISTS joined_main BOOLEAN DEFAULT FALSE",
         "ALTER TABLE ajv2_users ADD COLUMN IF NOT EXISTS proof_miss_count INTEGER DEFAULT 0",
         "ALTER TABLE ajv2_users ADD COLUMN IF NOT EXISTS banned BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE ajv2_users ADD COLUMN IF NOT EXISTS restart_count INTEGER DEFAULT 0",
+        "ALTER TABLE ajv2_users ADD COLUMN IF NOT EXISTS rules_accepted BOOLEAN DEFAULT FALSE",
         "ALTER TABLE ajv2_users ADD COLUMN IF NOT EXISTS banned_reason TEXT",
         "ALTER TABLE ajv2_rewards ADD COLUMN IF NOT EXISTS message_id BIGINT",
         "ALTER TABLE ajv2_rewards ADD COLUMN IF NOT EXISTS published_at TIMESTAMP",
@@ -261,12 +265,32 @@ def published_button():
     return InlineKeyboardMarkup([[InlineKeyboardButton("✅ J’ai publié", callback_data="proof:ready")]])
 
 
+def rules_buttons():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ J’accepte", callback_data="rules:yes"),
+         InlineKeyboardButton("❌ Je refuse", callback_data="rules:no")]
+    ])
+
+
+def default_rules_text():
+    return (
+        "📜 Règles du groupe\n\n"
+        "1. Une preuve quotidienne est obligatoire.\n"
+        "2. Les multi-comptes sont interdits.\n"
+        "3. Le contenu du groupe ne doit pas être partagé ailleurs.\n"
+        "4. Respecte les consignes données par les admins.\n"
+        "5. Toute tentative d’abus peut entraîner une exclusion définitive.\n\n"
+        "Acceptes-tu les règles ?"
+    )
+
+
 def admin_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📣 Groupes publicité", callback_data="admin:groups")],
         [InlineKeyboardButton("🧲 Publicité", callback_data="admin:ad")],
         [InlineKeyboardButton("🌐 Plateformes", callback_data="admin:platforms")],
         [InlineKeyboardButton("🎁 Ajouter récompense", callback_data="admin:reward")],
+        [InlineKeyboardButton("📜 Modifier règles", callback_data="admin:rules")],
         [InlineKeyboardButton("📊 Stats", callback_data="admin:stats")],
     ])
 
@@ -395,10 +419,6 @@ async def send_platform_content(context, chat_id, branch):
 
 
 async def send_invite(context, user_id):
-    if reward_lock_active():
-        await context.bot.send_message(user_id, "🔒 Les accès sont fermés pendant la période de récompense. Réessaie après la distribution.")
-        return
-
     with db() as s:
         main_group = get_config(s, "main_group_id", "")
 
@@ -419,6 +439,16 @@ async def send_invite(context, user_id):
         )
     except Exception as e:
         await context.bot.send_message(user_id, f"Erreur création lien : {e}")
+
+
+
+async def send_rules(context, user_id):
+    with db() as s:
+        rules = get_config(s, "rules_text", "")
+    text = rules if rules else default_rules_text()
+    if "Acceptes-tu" not in text and "acceptes" not in text.lower():
+        text += "\n\nAcceptes-tu les règles ?"
+    await context.bot.send_message(user_id, text, reply_markup=rules_buttons())
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -554,6 +584,37 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_platform_content(context, user.id, branch)
         return
 
+    if data == "rules:yes":
+        with db() as s:
+            u = get_user(s, user)
+            if not u.validated or u.banned:
+                s.commit()
+                await safe_edit(q, "Tu dois d’abord faire valider ta preuve.")
+                return
+            u.rules_accepted = True
+            s.commit()
+        await safe_edit(q, "✅ Règles acceptées. Génération de ton lien...")
+        await send_invite(context, user.id)
+        return
+
+    if data == "rules:no":
+        with db() as s:
+            u = get_user(s, user)
+            u.rules_accepted = False
+            u.validated = False
+            u.waiting_first_proof = False
+            u.branch = None
+            u.restart_count = (u.restart_count or 0) + 1
+            if u.restart_count > 1:
+                u.banned = True
+                u.banned_reason = "Refus des règles après deuxième tentative"
+                s.commit()
+                await safe_edit(q, "❌ Tu as refusé les règles. Tu ne peux plus recommencer.")
+                return
+            s.commit()
+        await safe_edit(q, "❌ Règles refusées. Tu peux recommencer une seule fois avec /start.")
+        return
+
     if data == "proof:ready":
         await safe_edit(q, "Envoie maintenant ta capture d’écran ici dans le bot.")
         return
@@ -600,7 +661,7 @@ async def admin_callback(q, context, data):
                     pass
 
                 if proof.kind == "first":
-                    await send_invite(context, u.telegram_id)
+                    await send_rules(context, u.telegram_id)
                 return
 
             if action == "refuse":
@@ -684,6 +745,11 @@ async def admin_callback(q, context, data):
         await safe_edit(q, "Envoie maintenant le lien récompense à publier ce soir.")
         return
 
+    if data == "admin:rules":
+        context.user_data["admin_waiting"] = "rules_text"
+        await safe_edit(q, "Envoie maintenant le texte complet des règles.")
+        return
+
     if data == "admin:stats":
         with db() as s:
             users = s.query(User).count()
@@ -717,6 +783,13 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             s.commit()
             context.user_data.pop("admin_waiting", None)
             await update.message.reply_text("✅ Photo publicité enregistrée.", reply_markup=admin_menu())
+            return
+
+        if waiting == "rules_text" and update.message.text:
+            set_config(s, "rules_text", update.message.text)
+            s.commit()
+            context.user_data.pop("admin_waiting", None)
+            await update.message.reply_text("✅ Règles enregistrées.", reply_markup=admin_menu())
             return
 
         if waiting == "reward" and update.message.text:
@@ -794,7 +867,7 @@ async def main_group_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for member in update.message.new_chat_members:
         with db() as s:
             u = s.query(User).filter_by(telegram_id=member.id).first()
-            allowed = bool(u and u.validated and not u.banned and not reward_lock_active())
+            allowed = bool(u and u.validated and u.rules_accepted and not u.banned)
             if allowed:
                 u.joined_main = True
                 s.commit()

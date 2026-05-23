@@ -134,3 +134,24 @@ Quand un admin clique sur ✅ Accepter ou ❌ Refuser :
 
 Table ajoutée :
 - `ajv2_admin_proof_messages`
+
+
+## Version règles
+
+Changements :
+- plus de fermeture d’accès pendant la période de récompense
+- après acceptation admin de la preuve, le bot envoie les règles
+- l’utilisateur doit cliquer :
+  - ✅ J’accepte → lien unique envoyé immédiatement
+  - ❌ Je refuse → il peut recommencer une seule fois
+- l’accès au groupe est autorisé seulement si :
+  - preuve acceptée
+  - règles acceptées
+  - utilisateur non banni
+
+Nouvelle option admin :
+- bouton `📜 Modifier règles` dans le panel
+
+Colonnes ajoutées :
+- `restart_count`
+- `rules_accepted`
