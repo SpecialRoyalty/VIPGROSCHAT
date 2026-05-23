@@ -81,6 +81,16 @@ class User(Base):
     updated_at = Column(DateTime, default=lambda: datetime.now(UTC).replace(tzinfo=None))
 
 
+class GroupRegistry(Base):
+    __tablename__ = "ajv2_group_registry"
+    id = Column(Integer, primary_key=True)
+    chat_id = Column(BigInteger, unique=True, index=True, nullable=False)
+    title = Column(String(255))
+    chat_type = Column(String(50))
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(UTC).replace(tzinfo=None))
+
+
 class PromoGroup(Base):
     __tablename__ = "ajv2_promo_groups"
     id = Column(Integer, primary_key=True)
@@ -150,6 +160,14 @@ def migrate():
         "ALTER TABLE ajv2_rewards ADD COLUMN IF NOT EXISTS published_at TIMESTAMP",
         "ALTER TABLE ajv2_rewards ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP",
         "ALTER TABLE ajv2_proofs ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'pending'",
+        """CREATE TABLE IF NOT EXISTS ajv2_group_registry (
+            id SERIAL PRIMARY KEY,
+            chat_id BIGINT UNIQUE NOT NULL,
+            title VARCHAR(255),
+            chat_type VARCHAR(50),
+            active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT NOW()
+        )""",
         """CREATE TABLE IF NOT EXISTS ajv2_admin_proof_messages (
             id SERIAL PRIMARY KEY,
             proof_id INTEGER NOT NULL,
@@ -306,6 +324,7 @@ def default_rules_text():
 
 def admin_menu():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⭐ Groupe principal", callback_data="admin:set_main")],
         [InlineKeyboardButton("📣 Groupes publicité", callback_data="admin:groups")],
         [InlineKeyboardButton("🧲 Publicité", callback_data="admin:ad")],
         [InlineKeyboardButton("🌐 Plateformes", callback_data="admin:platforms")],
@@ -496,6 +515,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+
+async def auto_register_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if not chat or chat.type not in ("group", "supergroup"):
+        return
+
+    with db() as s:
+        row = s.query(GroupRegistry).filter_by(chat_id=chat.id).first()
+        if not row:
+            row = GroupRegistry(
+                chat_id=chat.id,
+                title=chat.title,
+                chat_type=chat.type,
+                active=True
+            )
+            s.add(row)
+        else:
+            row.title = chat.title
+            row.chat_type = chat.type
+            row.active = True
+        s.commit()
+
+
 async def admin_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
@@ -504,27 +546,9 @@ async def admin_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cmd = update.message.text.split()[0]
 
-    with db() as s:
-        if cmd == "/setmain":
-            set_config(s, "main_group_id", str(chat.id))
-            s.commit()
-            await update.message.reply_text("✅ Groupe principal enregistré.")
-            return
-
-        if cmd == "/addpromo":
-            g = s.query(PromoGroup).filter_by(chat_id=chat.id).first()
-            if not g:
-                s.add(PromoGroup(chat_id=chat.id, title=chat.title, active=True))
-            else:
-                g.active = True
-                g.title = chat.title
-            s.commit()
-            await update.message.reply_text("✅ Groupe publicité ajouté.")
-            return
-
-        if cmd == "/panel":
-            await update.message.reply_text("🛠 Panel admin", reply_markup=admin_menu())
-            return
+    if cmd == "/panel":
+        await update.message.reply_text("🛠 Panel admin", reply_markup=admin_menu())
+        return
 
 
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -711,14 +735,94 @@ async def admin_callback(q, context, data):
         await safe_edit(q, "🛠 Panel admin", reply_markup=admin_menu())
         return
 
+    if data == "admin:set_main":
+        with db() as s:
+            groups = s.query(GroupRegistry).filter_by(active=True).all()
+
+        if not groups:
+            await safe_edit(q, "Aucun groupe détecté.\n\nAjoute d’abord le bot dans un groupe.")
+            return
+
+        kb_rows = []
+        for g in groups[:40]:
+            kb_rows.append([InlineKeyboardButton(
+                f"⭐ {g.title}",
+                callback_data=f"mainselect:{g.chat_id}"
+            )])
+
+        kb_rows.append([InlineKeyboardButton("⬅️ Menu", callback_data="admin:menu")])
+
+        await safe_edit(
+            q,
+            "Choisis le groupe principal :",
+            reply_markup=InlineKeyboardMarkup(kb_rows)
+        )
+        return
+
+    if data.startswith("mainselect:"):
+        chat_id = data.split(":")[1]
+
+        with db() as s:
+            set_config(s, "main_group_id", chat_id)
+            grp = s.query(GroupRegistry).filter_by(chat_id=int(chat_id)).first()
+            s.commit()
+
+        title = grp.title if grp else chat_id
+        await safe_edit(
+            q,
+            f"✅ Groupe principal défini : {title}",
+            reply_markup=admin_menu()
+        )
+        return
+
     if data == "admin:groups":
         with db() as s:
-            main = get_config(s, "main_group_id", "non défini")
-            groups = s.query(PromoGroup).filter_by(active=True).all()
-        txt = f"Groupe principal : {main}\n\nGroupes pub actifs :\n"
-        txt += "\n".join([f"- {g.title or g.chat_id}" for g in groups]) if groups else "Aucun"
-        txt += "\n\nCommandes : /setmain dans le groupe principal, /addpromo dans un groupe pub."
-        await safe_edit(q, txt, reply_markup=admin_menu())
+            detected = s.query(GroupRegistry).filter_by(active=True).all()
+            promos = {p.chat_id for p in s.query(PromoGroup).filter_by(active=True).all()}
+
+        if not detected:
+            await safe_edit(q, "Aucun groupe détecté.")
+            return
+
+        rows = []
+        for g in detected[:40]:
+            enabled = g.chat_id in promos
+            emoji = "✅" if enabled else "⬜"
+            rows.append([
+                InlineKeyboardButton(
+                    f"{emoji} {g.title}",
+                    callback_data=f"promotoggle:{g.chat_id}"
+                )
+            ])
+
+        rows.append([InlineKeyboardButton("⬅️ Menu", callback_data="admin:menu")])
+
+        await safe_edit(
+            q,
+            "📣 Sélectionne les groupes publicité :",
+            reply_markup=InlineKeyboardMarkup(rows)
+        )
+        return
+
+    if data.startswith("promotoggle:"):
+        chat_id = int(data.split(":")[1])
+
+        with db() as s:
+            grp = s.query(GroupRegistry).filter_by(chat_id=chat_id).first()
+            promo = s.query(PromoGroup).filter_by(chat_id=chat_id).first()
+
+            if promo:
+                s.delete(promo)
+            else:
+                s.add(PromoGroup(
+                    chat_id=chat_id,
+                    title=grp.title if grp else str(chat_id),
+                    active=True
+                ))
+
+            s.commit()
+
+        await admin_callback(q, context, "admin:groups")
         return
 
     if data == "admin:ad":
@@ -1212,7 +1316,8 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler(["setmain", "addpromo", "panel"], admin_commands))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS, auto_register_group), group=-10)
+    app.add_handler(CommandHandler(["panel"], admin_commands))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.StatusUpdate.ALL, cleanup_service_messages), group=-2)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, moderate_bad_words), group=-1)

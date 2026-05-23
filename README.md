@@ -178,3 +178,19 @@ Ajouté :
 
 Permission nécessaire dans le groupe principal :
 - supprimer messages
+
+
+## Détection automatique des groupes
+
+Plus besoin de :
+- `/setmain`
+- `/addpromo`
+
+Le bot détecte automatiquement tous les groupes où il est ajouté.
+
+Dans le panel admin :
+- ⭐ choisir le groupe principal
+- 📣 activer/désactiver les groupes publicité
+
+Nouvelle table :
+- `ajv2_group_registry`
