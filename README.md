@@ -194,3 +194,17 @@ Dans le panel admin :
 
 Nouvelle table :
 - `ajv2_group_registry`
+
+
+## Correctif sélection groupes
+
+Si les groupes n’apparaissent pas :
+1. ajoute le bot dans le groupe principal et les groupes pub
+2. dans chaque groupe, envoie `/detect` ou `/panel`
+3. retourne dans le bot en privé → panel admin
+4. clique ⭐ Groupe principal ou 📣 Groupes publicité
+
+Correctifs inclus :
+- callbacks `mainselect:*` et `promotoggle:*` corrigés
+- `/panel` en groupe force l’enregistrement du groupe
+- `/detect` en groupe force aussi l’enregistrement

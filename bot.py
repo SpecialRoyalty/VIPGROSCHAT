@@ -516,8 +516,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-async def auto_register_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
+async def save_group(chat):
     if not chat or chat.type not in ("group", "supergroup"):
         return
 
@@ -526,16 +525,21 @@ async def auto_register_group(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not row:
             row = GroupRegistry(
                 chat_id=chat.id,
-                title=chat.title,
+                title=chat.title or str(chat.id),
                 chat_type=chat.type,
                 active=True
             )
             s.add(row)
         else:
-            row.title = chat.title
+            row.title = chat.title or row.title or str(chat.id)
             row.chat_type = chat.type
             row.active = True
         s.commit()
+
+
+async def auto_register_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    await save_group(chat)
 
 
 async def admin_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -550,6 +554,10 @@ async def admin_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🛠 Panel admin", reply_markup=admin_menu())
         return
 
+    if cmd == "/detect":
+        await update.message.reply_text("✅ Groupe détecté/enregistré.")
+        return
+
 
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -557,7 +565,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = q.from_user
     data = q.data or ""
 
-    if data.startswith("admin:") or data.startswith("admbranch:") or data.startswith("ad:") or data.startswith("proofadmin:") or data.startswith("badwords:"):
+    if data.startswith("admin:") or data.startswith("admbranch:") or data.startswith("ad:") or data.startswith("proofadmin:") or data.startswith("badwords:") or data.startswith("mainselect:") or data.startswith("promotoggle:"):
         if not is_admin(user.id):
             await safe_edit(q, "Accès refusé.")
             return
@@ -740,7 +748,7 @@ async def admin_callback(q, context, data):
             groups = s.query(GroupRegistry).filter_by(active=True).all()
 
         if not groups:
-            await safe_edit(q, "Aucun groupe détecté.\n\nAjoute d’abord le bot dans un groupe.")
+            await safe_edit(q, "Aucun groupe détecté.\n\nDans chaque groupe, envoie /panel une fois pour forcer la détection, puis reviens ici.")
             return
 
         kb_rows = []
@@ -781,7 +789,7 @@ async def admin_callback(q, context, data):
             promos = {p.chat_id for p in s.query(PromoGroup).filter_by(active=True).all()}
 
         if not detected:
-            await safe_edit(q, "Aucun groupe détecté.")
+            await safe_edit(q, "Aucun groupe détecté. Dans chaque groupe, envoie /panel une fois pour forcer la détection.")
             return
 
         rows = []
@@ -1317,7 +1325,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, auto_register_group), group=-10)
-    app.add_handler(CommandHandler(["panel"], admin_commands))
+    app.add_handler(CommandHandler(["panel", "detect"], admin_commands))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.StatusUpdate.ALL, cleanup_service_messages), group=-2)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, moderate_bad_words), group=-1)
