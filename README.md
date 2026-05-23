@@ -15,6 +15,8 @@ DATABASE_URL=
 PUBLIC_BIO_TAG=@antijavana
 MAIN_CHANNEL=@antijavana
 INVITE_EXPIRE_MINUTES=10
+PROOF_START_HOUR=3
+PROOF_REMINDER_HOUR=18
 PROOF_KICK_HOUR=21
 PROOF_KICK_MINUTE=50
 REWARD_HOUR=22
@@ -155,3 +157,12 @@ Nouvelle option admin :
 Colonnes ajoutées :
 - `restart_count`
 - `rules_accepted`
+
+
+## Preuves quotidiennes améliorées
+
+- Les nouveaux membres ne sont pas contrôlés le jour où ils rejoignent.
+- À 03h, le bot envoie dans le groupe principal : session preuves ouverte.
+- À 18h, le bot mentionne les membres qui n’ont pas encore envoyé leur preuve.
+- Le message de rappel ne donne pas l’heure exacte de kick.
+- Chaque photo envoyée au bot reçoit : `✅ Preuve prise en compte.`

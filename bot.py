@@ -26,6 +26,8 @@ REWARD_HOUR = int(os.getenv("REWARD_HOUR", "22"))
 REWARD_MINUTE = int(os.getenv("REWARD_MINUTE", "5"))
 REWARD_DELETE_AFTER_HOURS = int(os.getenv("REWARD_DELETE_AFTER_HOURS", "2"))
 REWARD_LOCK_EXTRA_MINUTES = int(os.getenv("REWARD_LOCK_EXTRA_MINUTES", "5"))
+PROOF_START_HOUR = int(os.getenv("PROOF_START_HOUR", "3"))
+PROOF_REMINDER_HOUR = int(os.getenv("PROOF_REMINDER_HOUR", "18"))
 ADMIN_REWARD_REMINDER_HOURS = [int(x.strip()) for x in os.getenv("ADMIN_REWARD_REMINDER_HOURS", "12,18,21").split(",") if x.strip().isdigit()]
 REQUIRE_CHANNEL_JOIN = os.getenv("REQUIRE_CHANNEL_JOIN", "true").lower() == "true"
 
@@ -69,6 +71,7 @@ class User(Base):
     waiting_first_proof = Column(Boolean, default=False)
     validated = Column(Boolean, default=False)
     joined_main = Column(Boolean, default=False)
+    joined_main_at = Column(DateTime)
     proof_miss_count = Column(Integer, default=0)
     restart_count = Column(Integer, default=0)
     rules_accepted = Column(Boolean, default=False)
@@ -137,6 +140,7 @@ def migrate():
         "ALTER TABLE ajv2_users ADD COLUMN IF NOT EXISTS waiting_first_proof BOOLEAN DEFAULT FALSE",
         "ALTER TABLE ajv2_users ADD COLUMN IF NOT EXISTS validated BOOLEAN DEFAULT FALSE",
         "ALTER TABLE ajv2_users ADD COLUMN IF NOT EXISTS joined_main BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE ajv2_users ADD COLUMN IF NOT EXISTS joined_main_at TIMESTAMP",
         "ALTER TABLE ajv2_users ADD COLUMN IF NOT EXISTS proof_miss_count INTEGER DEFAULT 0",
         "ALTER TABLE ajv2_users ADD COLUMN IF NOT EXISTS banned BOOLEAN DEFAULT FALSE",
         "ALTER TABLE ajv2_users ADD COLUMN IF NOT EXISTS restart_count INTEGER DEFAULT 0",
@@ -870,6 +874,8 @@ async def main_group_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             allowed = bool(u and u.validated and u.rules_accepted and not u.banned)
             if allowed:
                 u.joined_main = True
+                if not u.joined_main_at:
+                    u.joined_main_at = now()
                 s.commit()
                 continue
             s.commit()
@@ -908,6 +914,80 @@ async def publish_ad(context):
             pass
 
 
+
+def user_due_for_daily_check(user):
+    """
+    Les nouveaux membres ne sont pas contrôlés le jour où ils rejoignent.
+    Le contrôle commence le lendemain.
+    """
+    if not user.joined_main_at:
+        return True
+    return user.joined_main_at.date() < today()
+
+
+def mention_user(user):
+    if user.username:
+        return f"@{user.username}"
+    name = user.first_name or "membre"
+    return f"[{name}](tg://user?id={user.telegram_id})"
+
+
+async def daily_proof_start_job(context):
+    with db() as s:
+        main_id = get_config(s, "main_group_id", "")
+        if not main_id:
+            return
+    try:
+        await context.bot.send_message(
+            int(main_id),
+            "📸 Session preuves ouverte.\n\nEnvoyez votre capture d’écran du jour au bot en privé."
+        )
+    except Exception:
+        pass
+
+
+async def daily_proof_reminder_job(context):
+    with db() as s:
+        main_id = get_config(s, "main_group_id", "")
+        if not main_id:
+            return
+
+        users = s.query(User).filter_by(validated=True, banned=False, joined_main=True).all()
+        missing = []
+        for u in users:
+            if not user_due_for_daily_check(u):
+                continue
+            has = s.query(Proof).filter_by(
+                telegram_id=u.telegram_id,
+                proof_date=today(),
+                status="accepted"
+            ).first()
+            if not has:
+                missing.append(u)
+
+    if not missing:
+        return
+
+    mentions = " ".join(mention_user(u) for u in missing[:50])
+    extra = ""
+    if len(missing) > 50:
+        extra = f"\n\n+ {len(missing) - 50} autres membres."
+
+    try:
+        await context.bot.send_message(
+            int(main_id),
+            f"⚠️ Preuves manquantes :\n\n{mentions}{extra}\n\nEnvoyez vite votre preuve au bot pour éviter une exclusion.",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        # fallback sans markdown
+        plain = " ".join([f"@{u.username}" if u.username else str(u.telegram_id) for u in missing[:50]])
+        await context.bot.send_message(
+            int(main_id),
+            f"⚠️ Preuves manquantes :\n\n{plain}{extra}\n\nEnvoyez vite votre preuve au bot pour éviter une exclusion."
+        )
+
+
 async def proof_deadline_job(context):
     with db() as s:
         if job_done(s, "proof_deadline") or not proof_cutoff_passed():
@@ -921,6 +1001,8 @@ async def proof_deadline_job(context):
     banned = 0
 
     for u in users:
+        if not user_due_for_daily_check(u):
+            continue
         with db() as s:
             has = s.query(Proof).filter_by(telegram_id=u.telegram_id, proof_date=today(), status="accepted").first()
             uu = s.query(User).filter_by(telegram_id=u.telegram_id).first()
@@ -1043,6 +1125,8 @@ def main():
 
     app.job_queue.run_once(boot, when=5)
     app.job_queue.run_repeating(catchup, interval=300, first=60)
+    app.job_queue.run_daily(daily_proof_start_job, time=time(hour=PROOF_START_HOUR, minute=0))
+    app.job_queue.run_daily(daily_proof_reminder_job, time=time(hour=PROOF_REMINDER_HOUR, minute=0))
     app.job_queue.run_daily(proof_deadline_job, time=time(hour=PROOF_KICK_HOUR, minute=PROOF_KICK_MINUTE))
     app.job_queue.run_daily(reward_job, time=time(hour=REWARD_HOUR, minute=REWARD_MINUTE))
     app.job_queue.run_repeating(reward_delete_job, interval=300, first=120)
