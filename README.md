@@ -74,3 +74,26 @@ En privé :
 - Suppression automatique de la récompense 2h après.
 - 1er oubli preuve = kick.
 - 2e oubli preuve = ban.
+
+
+## Mise à jour publicité
+
+Dans le panel admin :
+- 🧲 Publicité
+- Modifier texte pub
+- Modifier photo pub
+- Aperçu pub
+- Publier publicité
+
+Le bouton de pub est : `🔥 Je suis intéressé`.
+
+## Vérification canal
+
+Pour que `MAIN_CHANNEL=@antijavana` soit vérifié correctement, ajoute le bot comme admin du canal.
+Sinon Telegram peut empêcher le bot de voir les membres.
+
+Si tu veux désactiver la vérification canal temporairement :
+
+```env
+REQUIRE_CHANNEL_JOIN=false
+```

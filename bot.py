@@ -228,7 +228,7 @@ def bio_buttons():
 def channel_buttons():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 Ouvrir le canal", url=f"https://t.me/{MAIN_CHANNEL.lstrip('@')}")],
-        [InlineKeyboardButton("✅ Je suis le canal", callback_data="channel:check")],
+        [InlineKeyboardButton("✅ Je follow le canal", callback_data="channel:check")],
     ])
 
 
@@ -246,7 +246,7 @@ def published_button():
 def admin_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📣 Groupes publicité", callback_data="admin:groups")],
-        [InlineKeyboardButton("🧲 Publier publicité", callback_data="admin:publish_ad")],
+        [InlineKeyboardButton("🧲 Publicité", callback_data="admin:ad")],
         [InlineKeyboardButton("🌐 Plateformes", callback_data="admin:platforms")],
         [InlineKeyboardButton("🎁 Ajouter récompense", callback_data="admin:reward")],
         [InlineKeyboardButton("📊 Stats", callback_data="admin:stats")],
@@ -389,7 +389,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = q.from_user
     data = q.data or ""
 
-    if data.startswith("admin:") or data.startswith("admbranch:"):
+    if data.startswith("admin:") or data.startswith("admbranch:") or data.startswith("ad:"):
         if not is_admin(user.id):
             await safe_edit(q, "Accès refusé.")
             return
@@ -459,7 +459,32 @@ async def admin_callback(q, context, data):
         await safe_edit(q, txt, reply_markup=admin_menu())
         return
 
-    if data == "admin:publish_ad":
+    if data == "admin:ad":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✍️ Modifier texte pub", callback_data="ad:set_text")],
+            [InlineKeyboardButton("🖼 Modifier photo pub", callback_data="ad:set_photo")],
+            [InlineKeyboardButton("👀 Aperçu pub", callback_data="ad:preview")],
+            [InlineKeyboardButton("🚀 Publier publicité", callback_data="ad:publish")],
+            [InlineKeyboardButton("⬅️ Menu", callback_data="admin:menu")]
+        ])
+        await safe_edit(q, "🧲 Gestion publicité", reply_markup=kb)
+        return
+
+    if data == "ad:set_text":
+        context.user_data["admin_waiting"] = "ad_text"
+        await safe_edit(q, "Envoie maintenant le texte de publicité.")
+        return
+
+    if data == "ad:set_photo":
+        context.user_data["admin_waiting"] = "ad_photo"
+        await safe_edit(q, "Envoie maintenant la photo de publicité.")
+        return
+
+    if data == "ad:preview":
+        await send_ad_preview(context, q.message.chat_id)
+        return
+
+    if data == "ad:publish":
         await publish_ad(context)
         await safe_edit(q, "✅ Publicité publiée dans les groupes actifs.", reply_markup=admin_menu())
         return
@@ -500,6 +525,20 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     with db() as s:
+        if waiting == "ad_text" and update.message.text:
+            set_config(s, "ad_text", update.message.text)
+            s.commit()
+            context.user_data.pop("admin_waiting", None)
+            await update.message.reply_text("✅ Texte publicité enregistré.", reply_markup=admin_menu())
+            return
+
+        if waiting == "ad_photo" and update.message.photo:
+            set_config(s, "ad_photo", update.message.photo[-1].file_id)
+            s.commit()
+            context.user_data.pop("admin_waiting", None)
+            await update.message.reply_text("✅ Photo publicité enregistrée.", reply_markup=admin_menu())
+            return
+
         if waiting == "reward" and update.message.text:
             s.add(Reward(url=update.message.text.strip()))
             s.commit()
@@ -582,13 +621,29 @@ async def main_group_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+async def send_ad_preview(context, chat_id):
+    with db() as s:
+        text = get_config(s, "ad_text", "Recevez les médias du jour. Cliquez ci-dessous pour commencer.")
+        photo = get_config(s, "ad_photo", "")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Je suis intéressé", url=bot_url())]])
+    if photo:
+        await context.bot.send_photo(chat_id, photo=photo, caption=text, reply_markup=kb)
+    else:
+        await context.bot.send_message(chat_id, text, reply_markup=kb)
+
+
 async def publish_ad(context):
     with db() as s:
         groups = s.query(PromoGroup).filter_by(active=True).all()
-    text = "Recevez les médias du jour. Cliquez ci-dessous pour commencer."
+        text = get_config(s, "ad_text", "Recevez les médias du jour. Cliquez ci-dessous pour commencer.")
+        photo = get_config(s, "ad_photo", "")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Je suis intéressé", url=bot_url())]])
     for g in groups:
         try:
-            await context.bot.send_message(g.chat_id, text, reply_markup=start_buttons())
+            if photo:
+                await context.bot.send_photo(g.chat_id, photo=photo, caption=text, reply_markup=kb)
+            else:
+                await context.bot.send_message(g.chat_id, text, reply_markup=kb)
         except Exception:
             pass
 
